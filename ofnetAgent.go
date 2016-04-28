@@ -385,19 +385,19 @@ func (self *OfnetAgent) AddLocalEndpoint(endpoint EndpointInfo) error {
 	}
 	// Build endpoint registry info
 	epreg := &OfnetEndpoint{
-		EndpointID:    epId,
-		EndpointType:  "internal",
-		EndpointGroup: endpoint.EndpointGroup,
-		IpAddr:        endpoint.IpAddr,
-		IpMask:        net.ParseIP("255.255.255.255"),
-		Vrf:           *vrf,
-		MacAddrStr:    endpoint.MacAddr.String(),
-		Vlan:          endpoint.Vlan,
-		Vni:           *vni,
-		OriginatorIp:  self.localIp,
-		PortNo:        endpoint.PortNo,
-		Timestamp:     time.Now(),
-		EndpointGroup: endpoint.EndpointGroup,
+		EndpointID:        epId,
+		EndpointType:      "internal",
+		EndpointGroup:     endpoint.EndpointGroup,
+		IpAddr:            endpoint.IpAddr,
+		IpMask:            net.ParseIP("255.255.255.255"),
+		Vrf:               *vrf,
+		MacAddrStr:        endpoint.MacAddr.String(),
+		Vlan:              endpoint.Vlan,
+		Vni:               *vni,
+		OriginatorIp:      self.localIp,
+		PortNo:            endpoint.PortNo,
+		Timestamp:         time.Now(),
+		EndpointGroupVlan: endpoint.EndpointGroupVlan,
 	}
 
 	// Call the datapath
