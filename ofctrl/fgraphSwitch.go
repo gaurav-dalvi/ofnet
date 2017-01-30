@@ -18,10 +18,7 @@ package ofctrl
 
 import (
 	"errors"
-
 	"github.com/shaleman/libOpenflow/openflow13"
-
-	// log "github.com/Sirupsen/logrus"
 )
 
 // Initialize the fgraph elements on the switch
@@ -82,7 +79,6 @@ func (self *OFSwitch) NewTable(tableId uint8) (*Table, error) {
 	table.Switch = self
 	table.TableId = tableId
 	table.flowDb = make(map[string]*Flow)
-
 	// Save it in the DB
 	self.tableDb[tableId] = table
 

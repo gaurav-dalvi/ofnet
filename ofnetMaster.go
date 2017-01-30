@@ -17,6 +17,7 @@ package ofnet
 // This file contains the ofnet master implementation
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -29,13 +30,19 @@ import (
 	log "github.com/Sirupsen/logrus"
 )
 
+// per agent stats
+type ofnetAgentStats struct {
+	Stats map[string]uint64
+}
+
 // Ofnet master state
 type OfnetMaster struct {
 	myAddr      string       // Address where we are listening
 	myPort      uint16       // port where we are listening
 	rpcServer   *rpc.Server  // json-rpc server
 	rpcListener net.Listener // Listener
-	masterMutex sync.Mutex   // Mutex to lock master datastructures
+	masterMutex sync.RWMutex // Mutex to lock master datastructures
+	statsMutex  sync.Mutex   // Mutex to protect stats update
 
 	// Database of agent nodes
 	agentDb map[string]*OfnetNode
@@ -45,6 +52,9 @@ type OfnetMaster struct {
 
 	// Policy database
 	policyDb map[string]*OfnetPolicyRule
+
+	// agent stats
+	agentStats map[string]*ofnetAgentStats
 }
 
 // Create new Ofnet master
@@ -80,6 +90,23 @@ func (self *OfnetMaster) Delete() error {
 	return nil
 }
 
+// incrAgentStats increments an agent key
+func (self *OfnetMaster) incrAgentStats(hostKey, statName string) {
+	self.statsMutex.Lock()
+	defer self.statsMutex.Unlock()
+
+	// lookup the agent
+	agentStats := self.agentStats[hostKey]
+	if agentStats == nil {
+		return
+	}
+
+	// increment the stats
+	currStats := agentStats.Stats[statName]
+	currStats++
+	agentStats.Stats[statName] = currStats
+}
+
 // AddNode adds a node by calling MasterAdd rpc call on the node
 func (self *OfnetMaster) AddNode(hostInfo OfnetNode) error {
 	var resp bool
@@ -99,7 +126,7 @@ func (self *OfnetMaster) AddNode(hostInfo OfnetNode) error {
 	return nil
 }
 
-// Register an agent
+// RegisterNode registers an agent
 func (self *OfnetMaster) RegisterNode(hostInfo *OfnetNode, ret *bool) error {
 	// Create a node
 	node := new(OfnetNode)
@@ -115,6 +142,10 @@ func (self *OfnetMaster) RegisterNode(hostInfo *OfnetNode, ret *bool) error {
 
 	log.Infof("Registered node: %+v", node)
 
+	// take a read lock for accessing db
+	self.masterMutex.RLock()
+	defer self.masterMutex.RUnlock()
+
 	// Send all existing endpoints to the new node
 	for _, endpoint := range self.endpointDb {
 		if node.HostAddr != endpoint.OriginatorIp.String() {
@@ -126,6 +157,7 @@ func (self *OfnetMaster) RegisterNode(hostInfo *OfnetNode, ret *bool) error {
 			err := client.Call("OfnetAgent.EndpointAdd", endpoint, &resp)
 			if err != nil {
 				log.Errorf("Error adding endpoint to %s. Err: %v", node.HostAddr, err)
+				// continue sending other endpoints
 			}
 		}
 	}
@@ -140,9 +172,28 @@ func (self *OfnetMaster) RegisterNode(hostInfo *OfnetNode, ret *bool) error {
 		err := client.Call("PolicyAgent.AddRule", rule, &resp)
 		if err != nil {
 			log.Errorf("Error adding rule to %s. Err: %v", node.HostAddr, err)
-			return err
+			// continue sending other rules
 		}
 	}
+
+	// increment stats
+	self.incrAgentStats(hostKey, "registered")
+
+	return nil
+}
+
+// UnRegisterNode unregisters an agent
+func (self *OfnetMaster) UnRegisterNode(hostInfo *OfnetNode, ret *bool) error {
+	hostKey := fmt.Sprintf("%s:%d", hostInfo.HostAddr, hostInfo.HostPort)
+
+	// Add it to DB
+	self.masterMutex.Lock()
+	delete(self.agentDb, hostKey)
+	self.masterMutex.Unlock()
+	rpcHub.DisconnectClient(hostInfo.HostPort, hostInfo.HostAddr)
+
+	// increment stats
+	self.incrAgentStats(hostKey, "unregistered")
 
 	return nil
 }
@@ -152,7 +203,9 @@ func (self *OfnetMaster) EndpointAdd(ep *OfnetEndpoint, ret *bool) error {
 
 	log.Infof("Received Endpoint CReate from Remote netplugin")
 	// Check if we have the endpoint already and which is more recent
+	self.masterMutex.RLock()
 	oldEp := self.endpointDb[ep.EndpointID]
+	self.masterMutex.RUnlock()
 	if oldEp != nil {
 		// If old endpoint has more recent timestamp, nothing to do
 		if !ep.Timestamp.After(oldEp.Timestamp) {
@@ -161,10 +214,16 @@ func (self *OfnetMaster) EndpointAdd(ep *OfnetEndpoint, ret *bool) error {
 	}
 
 	// Save the endpoint in DB
+	self.masterMutex.Lock()
 	self.endpointDb[ep.EndpointID] = ep
+	self.masterMutex.Unlock()
+
+	// take a read lock for accessing db
+	self.masterMutex.RLock()
+	defer self.masterMutex.RUnlock()
 
 	// Publish it to all agents except where it came from
-	for _, node := range self.agentDb {
+	for nodeKey, node := range self.agentDb {
 		if node.HostAddr != ep.OriginatorIp.String() {
 			var resp bool
 
@@ -174,7 +233,13 @@ func (self *OfnetMaster) EndpointAdd(ep *OfnetEndpoint, ret *bool) error {
 			err := client.Call("OfnetAgent.EndpointAdd", ep, &resp)
 			if err != nil {
 				log.Errorf("Error adding endpoint to %s. Err: %v", node.HostAddr, err)
-				return err
+				// Continue sending the message to other nodes
+
+				// increment stats
+				self.incrAgentStats(nodeKey, "EndpointAddFailure")
+			} else {
+				// increment stats
+				self.incrAgentStats(nodeKey, "EndpointAddSent")
 			}
 		}
 	}
@@ -186,7 +251,9 @@ func (self *OfnetMaster) EndpointAdd(ep *OfnetEndpoint, ret *bool) error {
 // Delete an Endpoint
 func (self *OfnetMaster) EndpointDel(ep *OfnetEndpoint, ret *bool) error {
 	// Check if we have the endpoint, if we dont have the endpoint, nothing to do
+	self.masterMutex.RLock()
 	oldEp := self.endpointDb[ep.EndpointID]
+	self.masterMutex.RUnlock()
 	if oldEp == nil {
 		log.Errorf("Received endpoint DELETE on a non existing endpoint %+v", ep)
 		return nil
@@ -198,10 +265,16 @@ func (self *OfnetMaster) EndpointDel(ep *OfnetEndpoint, ret *bool) error {
 	}
 
 	// Delete the endpoint from DB
+	self.masterMutex.Lock()
 	delete(self.endpointDb, ep.EndpointID)
+	self.masterMutex.Unlock()
+
+	// take a read lock for accessing db
+	self.masterMutex.RLock()
+	defer self.masterMutex.RUnlock()
 
 	// Publish it to all agents except where it came from
-	for _, node := range self.agentDb {
+	for nodeKey, node := range self.agentDb {
 		if node.HostAddr != ep.OriginatorIp.String() {
 			var resp bool
 
@@ -211,7 +284,13 @@ func (self *OfnetMaster) EndpointDel(ep *OfnetEndpoint, ret *bool) error {
 			err := client.Call("OfnetAgent.EndpointDel", ep, &resp)
 			if err != nil {
 				log.Errorf("Error sending DELERE endpoint to %s. Err: %v", node.HostAddr, err)
-				return err
+				// Continue sending the message to other nodes
+
+				// increment stats
+				self.incrAgentStats(nodeKey, "EndpointDelFailure")
+			} else {
+				// increment stats
+				self.incrAgentStats(nodeKey, "EndpointDelSent")
 			}
 		}
 	}
@@ -228,10 +307,16 @@ func (self *OfnetMaster) AddRule(rule *OfnetPolicyRule) error {
 	}
 
 	// Save the rule in DB
+	self.masterMutex.Lock()
 	self.policyDb[rule.RuleId] = rule
+	self.masterMutex.Unlock()
 
-	// Publish it to all agents except where it came from
-	for _, node := range self.agentDb {
+	// take a read lock for accessing db
+	self.masterMutex.RLock()
+	defer self.masterMutex.RUnlock()
+
+	// Publish it to all agents
+	for nodeKey, node := range self.agentDb {
 		var resp bool
 
 		log.Infof("Sending rule: %+v to node %s:%d", rule, node.HostAddr, node.HostPort)
@@ -240,7 +325,13 @@ func (self *OfnetMaster) AddRule(rule *OfnetPolicyRule) error {
 		err := client.Call("PolicyAgent.AddRule", rule, &resp)
 		if err != nil {
 			log.Errorf("Error adding rule to %s. Err: %v", node.HostAddr, err)
-			return err
+			// Continue sending the message to other nodes
+
+			// increment stats
+			self.incrAgentStats(nodeKey, "AddRuleFailure")
+		} else {
+			// increment stats
+			self.incrAgentStats(nodeKey, "AddRuleSent")
 		}
 	}
 
@@ -255,10 +346,16 @@ func (self *OfnetMaster) DelRule(rule *OfnetPolicyRule) error {
 	}
 
 	// Remove the rule from DB
+	self.masterMutex.Lock()
 	delete(self.policyDb, rule.RuleId)
+	self.masterMutex.Unlock()
 
-	// Publish it to all agents except where it came from
-	for _, node := range self.agentDb {
+	// take a read lock for accessing db
+	self.masterMutex.RLock()
+	defer self.masterMutex.RUnlock()
+
+	// Publish it to all agents
+	for nodeKey, node := range self.agentDb {
 		var resp bool
 
 		log.Infof("Sending DELETE rule: %+v to node %s", rule, node.HostAddr)
@@ -267,7 +364,13 @@ func (self *OfnetMaster) DelRule(rule *OfnetPolicyRule) error {
 		err := client.Call("PolicyAgent.DelRule", rule, &resp)
 		if err != nil {
 			log.Errorf("Error adding rule to %s. Err: %v", node.HostAddr, err)
-			return err
+			// Continue sending the message to other nodes
+
+			// increment stats
+			self.incrAgentStats(nodeKey, "DelRuleFailure")
+		} else {
+			// increment stats
+			self.incrAgentStats(nodeKey, "DelRuleSent")
 		}
 	}
 
@@ -276,7 +379,7 @@ func (self *OfnetMaster) DelRule(rule *OfnetPolicyRule) error {
 
 // Make a dummy RPC call to all agents. for testing purposes..
 func (self *OfnetMaster) MakeDummyRpcCall() error {
-	// Publish it to all agents except where it came from
+	// Call all agents
 	for _, node := range self.agentDb {
 		var resp bool
 		dummyArg := "dummy string"
@@ -287,9 +390,62 @@ func (self *OfnetMaster) MakeDummyRpcCall() error {
 		err := client.Call("OfnetAgent.DummyRpc", &dummyArg, &resp)
 		if err != nil {
 			log.Errorf("Error making dummy rpc call to %+v. Err: %v", node, err)
-			return err
+			// Continue sending the message to other nodes
 		}
 	}
 
 	return nil
+}
+
+// InjectGARPs triggers GARPS in the datapath on the specified epg
+func (self *OfnetMaster) InjectGARPs(epgID int) {
+	// take a read lock for accessing db
+	self.masterMutex.RLock()
+	defer self.masterMutex.RUnlock()
+
+	// Send to all agents
+	for nodeKey, node := range self.agentDb {
+		var resp bool
+
+		client := rpcHub.Client(node.HostAddr, node.HostPort)
+		err := client.Call("OfnetAgent.InjectGARPs", epgID, &resp)
+		if err != nil {
+			log.Errorf("Error triggering GARP on %s. Err: %v", node.HostAddr, err)
+
+			// increment stats
+			self.incrAgentStats(nodeKey, "InjectGARPsFailure")
+		} else {
+			// increment stats
+			self.incrAgentStats(nodeKey, "InjectGARPsSent")
+		}
+	}
+}
+
+// InspectState returns current state as json
+func (self *OfnetMaster) InspectState() ([]byte, error) {
+	// convert ofnet struct to an exported struct for json marshaling
+	ofnetExport := struct {
+		MyAddr     string                      // Address where we are listening
+		MyPort     uint16                      // port where we are listening
+		AgentDb    map[string]*OfnetNode       // Database of agent nodes
+		EndpointDb map[string]*OfnetEndpoint   // Endpoint database
+		PolicyDb   map[string]*OfnetPolicyRule // Policy database
+		AgentStats map[string]*ofnetAgentStats // Agent stats
+	}{
+		self.myAddr,
+		self.myPort,
+		self.agentDb,
+		self.endpointDb,
+		self.policyDb,
+		self.agentStats,
+	}
+
+	// convert struct to json
+	jsonStats, err := json.Marshal(ofnetExport)
+	if err != nil {
+		log.Errorf("Error encoding ofnet master state. Err: %v", err)
+		return []byte{}, err
+	}
+
+	return jsonStats, nil
 }

@@ -18,8 +18,8 @@ package ofctrl
 
 import (
 	"errors"
-
 	"github.com/shaleman/libOpenflow/openflow13"
+	"sync"
 
 	log "github.com/Sirupsen/logrus"
 )
@@ -29,6 +29,7 @@ type Table struct {
 	Switch  *OFSwitch
 	TableId uint8
 	flowDb  map[string]*Flow // database of flow entries
+	lock    sync.Mutex       // lock flodb modification
 }
 
 // Fgraph element type for table
@@ -42,16 +43,20 @@ func (self *Table) GetFlowInstr() openflow13.Instruction {
 }
 
 // FIXME: global unique flow cookie
-var globalFlowId uint64 = 1
+var globalFlowID uint64 = 1
 
 // Create a new flow on the table
 func (self *Table) NewFlow(match FlowMatch) (*Flow, error) {
+	// modifications to flowdb requires a lock
+	self.lock.Lock()
+	defer self.lock.Unlock()
+
 	flow := new(Flow)
 	flow.Table = self
 	flow.Match = match
 	flow.isInstalled = false
-	flow.flowId = globalFlowId // FIXME: need a better id allocation
-	globalFlowId += 1
+	flow.FlowID = globalFlowID // FIXME: need a better id allocation
+	globalFlowID += 1
 	flow.flowActions = make([]*FlowAction, 0)
 
 	log.Debugf("Creating new flow for match: %+v", match)
@@ -73,6 +78,10 @@ func (self *Table) NewFlow(match FlowMatch) (*Flow, error) {
 
 // Delete a flow from the table
 func (self *Table) DeleteFlow(flowKey string) error {
+	// modifications to flowdb requires a lock
+	self.lock.Lock()
+	defer self.lock.Unlock()
+
 	// first empty it and then delete it.
 	self.flowDb[flowKey] = nil
 	delete(self.flowDb, flowKey)

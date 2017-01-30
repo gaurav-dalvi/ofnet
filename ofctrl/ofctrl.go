@@ -47,6 +47,9 @@ type AppInterface interface {
 
 	// Controller received a packet from the switch
 	PacketRcvd(sw *OFSwitch, pkt *PacketIn)
+
+	// Controller received a multi-part reply from the switch
+	MultipartReply(sw *OFSwitch, rep *openflow13.MultipartReply)
 }
 
 type Controller struct {
@@ -63,7 +66,6 @@ func NewController(app AppInterface) *Controller {
 
 	// Save the handler
 	c.app = app
-
 	return c
 }
 
@@ -95,6 +97,7 @@ func (c *Controller) Listen(port string) {
 
 // Cleanup the controller
 func (c *Controller) Delete() {
+	c.app = nil
 	c.listener.Close()
 }
 

@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/rpc"
 	"reflect"
+	"sync"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/contiv/ofnet/ofctrl"
@@ -32,7 +33,7 @@ const TCP_FLAG_SYN = 0x2
 
 // PolicyRule has info about single rule
 type PolicyRule struct {
-	rule *OfnetPolicyRule // rule definition
+	Rule *OfnetPolicyRule // rule definition
 	flow *ofctrl.Flow     // Flow associated with the flow
 }
 
@@ -44,7 +45,8 @@ type PolicyAgent struct {
 	policyTable *ofctrl.Table           // Policy rule lookup table
 	nextTable   *ofctrl.Table           // Next table to goto for accepted packets
 	Rules       map[string]*PolicyRule  // rules database
-	DstGrpFlow  map[string]*ofctrl.Flow // FLow entries for dst group lookup
+	dstGrpFlow  map[string]*ofctrl.Flow // FLow entries for dst group lookup
+	mutex       sync.RWMutex
 }
 
 // NewPolicyMgr Creates a new policy manager
@@ -54,7 +56,7 @@ func NewPolicyAgent(agent *OfnetAgent, rpcServ *rpc.Server) *PolicyAgent {
 	// initialize
 	policyAgent.agent = agent
 	policyAgent.Rules = make(map[string]*PolicyRule)
-	policyAgent.DstGrpFlow = make(map[string]*ofctrl.Flow)
+	policyAgent.dstGrpFlow = make(map[string]*ofctrl.Flow)
 
 	// Register for Master add/remove events
 	rpcServ.Register(policyAgent)
@@ -115,24 +117,125 @@ func ruleIsSame(r1, r2 *OfnetPolicyRule) bool {
 // AddEndpoint adds an endpoint to dst group lookup
 func (self *PolicyAgent) AddEndpoint(endpoint *OfnetEndpoint) error {
 
-	if self.DstGrpFlow[endpoint.EndpointID] != nil {
+	self.mutex.RLock()
+	if self.dstGrpFlow[endpoint.EndpointID] != nil {
 		// FIXME: handle this as Update
 		log.Warnf("DstGroup for endpoint %+v already exists", endpoint)
+		self.mutex.RUnlock()
 		return nil
 	}
+	self.mutex.RUnlock()
 
 	log.Infof("Adding dst group entry for endpoint: %+v", endpoint)
-	vrf := self.agent.vlanVrf[endpoint.Vlan]
 
+	vrf := self.agent.getvlanVrf(endpoint.Vlan)
+
+	if vrf == nil {
+		log.Errorf("Error finding vrf for vlan %d", endpoint.Vlan)
+		return errors.New("Error finding vrf for vlan")
+	}
 	log.Infof("Recevied add endpoint for vrf %v", *vrf)
 
+	self.agent.vrfMutex.RLock()
 	vrfid := self.agent.vrfNameIdMap[*vrf]
+	self.agent.vrfMutex.RUnlock()
 	vrfMetadata, vrfMetadataMask := Vrfmetadata(*vrfid)
 	// Install the Dst group lookup flow
 	dstGrpFlow, err := self.dstGrpTable.NewFlow(ofctrl.FlowMatch{
 		Priority:     FLOW_MATCH_PRIORITY,
 		Ethertype:    0x0800,
 		IpDa:         &endpoint.IpAddr,
+		Metadata:     &vrfMetadata,
+		MetadataMask: &vrfMetadataMask,
+	})
+	if err != nil {
+		log.Errorf("Error adding dstGroup flow for %v. Err: %v", endpoint.IpAddr, err)
+		return err
+	}
+
+	// Format the metadata
+	metadata, metadataMask := DstGroupMetadata(endpoint.EndpointGroup)
+
+	// Set dst GroupId
+	err = dstGrpFlow.SetMetadata(metadata, metadataMask)
+	if err != nil {
+		log.Errorf("Error setting metadata %v for flow {%+v}. Err: %v", metadata, dstGrpFlow, err)
+		return err
+	}
+	// Go to policy Table
+	err = dstGrpFlow.Next(self.policyTable)
+	if err != nil {
+		log.Errorf("Error installing flow {%+v}. Err: %v", dstGrpFlow, err)
+		return err
+	}
+
+	// save the Flow
+	self.mutex.Lock()
+	self.dstGrpFlow[endpoint.EndpointID] = dstGrpFlow
+	self.mutex.Unlock()
+	return nil
+}
+
+// DelEndpoint deletes an endpoint from dst group lookup
+func (self *PolicyAgent) DelEndpoint(endpoint *OfnetEndpoint) error {
+
+	// find the dst group flow
+	self.mutex.RLock()
+	dstGrp := self.dstGrpFlow[endpoint.EndpointID]
+	self.mutex.RUnlock()
+	if dstGrp == nil {
+		return errors.New("Dst Group not found")
+	}
+
+	// delete the Flow
+	err := dstGrp.Delete()
+	if err != nil {
+		log.Errorf("Error deleting dst group for endpoint: %+v. Err: %v", endpoint, err)
+	}
+
+	// delete the cache
+	self.mutex.Lock()
+	delete(self.dstGrpFlow, endpoint.EndpointID)
+	self.mutex.Unlock()
+	return nil
+}
+
+// AddIpv6Endpoint adds an endpoint to dst group lookup
+func (self *PolicyAgent) AddIpv6Endpoint(endpoint *OfnetEndpoint) error {
+
+	if endpoint.Ipv6Addr == nil {
+		log.Warnf("DstGroup for IPv6 endpoint %+v without Ipv6Addr", endpoint)
+		return nil
+	}
+
+	ipv6EpId := self.agent.getEndpointIdByIpVlan(endpoint.Ipv6Addr, endpoint.Vlan)
+	self.mutex.RLock()
+	if self.dstGrpFlow[ipv6EpId] != nil {
+		// FIXME: handle this as Update
+		log.Warnf("DstGroup for IPv6 endpoint %+v already exists", endpoint)
+		self.mutex.RUnlock()
+		return nil
+	}
+	self.mutex.RUnlock()
+
+	log.Infof("Adding dst group entry for endpoint: %+v", endpoint)
+	vrf := self.agent.getvlanVrf(endpoint.Vlan)
+
+	if vrf == nil {
+		log.Errorf("Error finding vrf for vlan %d", endpoint.Vlan)
+		return errors.New("Error finding vrf for vlan")
+	}
+	log.Infof("Recevied add endpoint for vrf %v", *vrf)
+	self.agent.vrfMutex.RLock()
+	vrfid := self.agent.vrfNameIdMap[*vrf]
+	self.agent.vrfMutex.RUnlock()
+
+	vrfMetadata, vrfMetadataMask := Vrfmetadata(*vrfid)
+	// Install the Dst group lookup flow
+	dstGrpFlow, err := self.dstGrpTable.NewFlow(ofctrl.FlowMatch{
+		Priority:     FLOW_MATCH_PRIORITY,
+		Ethertype:    0x86DD,
+		Ipv6Da:       &endpoint.Ipv6Addr,
 		Metadata:     &vrfMetadata,
 		MetadataMask: &vrfMetadataMask,
 	})
@@ -159,29 +262,34 @@ func (self *PolicyAgent) AddEndpoint(endpoint *OfnetEndpoint) error {
 	}
 
 	// save the Flow
-	self.DstGrpFlow[endpoint.EndpointID] = dstGrpFlow
-
+	self.mutex.Lock()
+	self.dstGrpFlow[ipv6EpId] = dstGrpFlow
+	self.mutex.Unlock()
 	return nil
 }
 
-// DelEndpoint deletes an endpoint from dst group lookup
-func (self *PolicyAgent) DelEndpoint(endpoint *OfnetEndpoint) error {
-	// find the dst group flow
+// DelIpv6Endpoint deletes an endpoint from dst group lookup
+func (self *PolicyAgent) DelIpv6Endpoint(endpoint *OfnetEndpoint) error {
 
-	dstGrp := self.DstGrpFlow[endpoint.EndpointID]
+	// find the dst group IPv6 flow
+	ipv6EpId := self.agent.getEndpointIdByIpVlan(endpoint.Ipv6Addr, endpoint.Vlan)
+	self.mutex.RLock()
+	dstGrp := self.dstGrpFlow[ipv6EpId]
 	if dstGrp == nil {
-		return errors.New("Dst Group not found")
+		self.mutex.RUnlock()
+		return errors.New("Dst Group IPv6 Flow not found")
 	}
-
+	self.mutex.RUnlock()
 	// delete the Flow
 	err := dstGrp.Delete()
 	if err != nil {
-		log.Errorf("Error deleting dst group for endpoint: %+v. Err: %v", endpoint, err)
+		log.Errorf("Error deleting dst group for IPv6 endpoint: %+v. Err: %v", endpoint, err)
 	}
 
 	// delete the cache
-	delete(self.DstGrpFlow, endpoint.EndpointID)
-
+	self.mutex.RLock()
+	delete(self.dstGrpFlow, ipv6EpId)
+	self.mutex.RUnlock()
 	return nil
 }
 
@@ -197,17 +305,26 @@ func (self *PolicyAgent) AddRule(rule *OfnetPolicyRule, ret *bool) error {
 	var flagPtr, flagMaskPtr *uint16
 	var err error
 
+	// make sure switch is connected
+	if !self.agent.IsSwitchConnected() {
+		self.agent.WaitForSwitchConnection()
+	}
+
 	// check if we already have the rule
+	self.mutex.RLock()
 	if self.Rules[rule.RuleId] != nil {
-		oldRule := self.Rules[rule.RuleId].rule
+		oldRule := self.Rules[rule.RuleId].Rule
 
 		if ruleIsSame(oldRule, rule) {
+			self.mutex.RUnlock()
 			return nil
 		} else {
+			self.mutex.RUnlock()
 			log.Errorf("Rule already exists. new rule: {%+v}, old rule: {%+v}", rule, oldRule)
 			return errors.New("Rule already exists")
 		}
 	}
+	self.mutex.RUnlock()
 
 	log.Infof("Received AddRule: %+v", rule)
 
@@ -316,10 +433,12 @@ func (self *PolicyAgent) AddRule(rule *OfnetPolicyRule, ret *bool) error {
 
 	// save the rule
 	pRule := PolicyRule{
-		rule: rule,
+		Rule: rule,
 		flow: ruleFlow,
 	}
+	self.mutex.Lock()
 	self.Rules[rule.RuleId] = &pRule
+	self.mutex.Unlock()
 
 	return nil
 }
@@ -329,6 +448,8 @@ func (self *PolicyAgent) DelRule(rule *OfnetPolicyRule, ret *bool) error {
 	log.Infof("Received DelRule: %+v", rule)
 
 	// Gte the rule
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
 	cache := self.Rules[rule.RuleId]
 	if cache == nil {
 		log.Errorf("Could not find rule: %+v", rule)

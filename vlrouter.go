@@ -27,8 +27,8 @@ package ofnet
 //
 
 import (
-	//"fmt"
 	"errors"
+	"fmt"
 	"net"
 	"net/rpc"
 	"strings"
@@ -37,6 +37,7 @@ import (
 	"github.com/contiv/ofnet/ofctrl"
 	"github.com/shaleman/libOpenflow/openflow13"
 	"github.com/shaleman/libOpenflow/protocol"
+	cmap "github.com/streamrail/concurrent-map"
 )
 
 // Vlrouter state.
@@ -45,6 +46,7 @@ type Vlrouter struct {
 	agent       *OfnetAgent      // Pointer back to ofnet agent that owns this
 	ofSwitch    *ofctrl.OFSwitch // openflow switch we are talking to
 	policyAgent *PolicyAgent     // Policy agent
+	svcProxy    *ServiceProxy    // Service proxy
 
 	// Fgraph tables
 	inputTable *ofctrl.Table // Packet lookup starts here
@@ -52,12 +54,25 @@ type Vlrouter struct {
 	ipTable    *ofctrl.Table // IP lookup table
 
 	// Flow Database
-	flowDb         map[string]*ofctrl.Flow // Database of flow entries
-	portVlanFlowDb map[uint32]*ofctrl.Flow // Database of flow entries
+	flowDb         map[string]*ofctrl.Flow   // Database of flow entries
+	portVlanFlowDb map[uint32]*ofctrl.Flow   // Database of flow entries
+	dscpFlowDb     map[uint32][]*ofctrl.Flow // Database of flow entries
+	portDnsFlowDb  cmap.ConcurrentMap        // Database of flow entries
 
-	myRouterMac   net.HardwareAddr  //Router mac used for external proxy
-	myBgpPeer     string            // bgp neighbor
-	unresolvedEPs map[string]string // unresolved endpoint map
+	uplinkPortDb  cmap.ConcurrentMap // Database of uplink ports
+	myRouterMac   net.HardwareAddr   //Router mac used for external proxy
+	anycastMac    net.HardwareAddr   //Anycast mac used for local endpoints
+	myBgpPeer     string             // bgp neighbor
+	unresolvedEPs cmap.ConcurrentMap // unresolved endpoint map
+}
+
+// GetUplink API gets the uplink port with uplinkID from uplink DB
+func (self *Vlrouter) GetUplink(uplinkID string) *PortInfo {
+	uplink, ok := self.uplinkPortDb.Get(uplinkID)
+	if !ok {
+		return nil
+	}
+	return uplink.(*PortInfo)
 }
 
 // Create a new vlrouter instance
@@ -69,12 +84,17 @@ func NewVlrouter(agent *OfnetAgent, rpcServ *rpc.Server) *Vlrouter {
 
 	// Create policy agent
 	vlrouter.policyAgent = NewPolicyAgent(agent, rpcServ)
+	vlrouter.svcProxy = NewServiceProxy(agent)
 
 	// Create a flow dbs and my router mac
 	vlrouter.flowDb = make(map[string]*ofctrl.Flow)
 	vlrouter.portVlanFlowDb = make(map[uint32]*ofctrl.Flow)
-	vlrouter.myRouterMac, _ = net.ParseMAC("00:00:11:11:11:11")
-	vlrouter.unresolvedEPs = make(map[string]string)
+	vlrouter.dscpFlowDb = make(map[uint32][]*ofctrl.Flow)
+	vlrouter.portDnsFlowDb = cmap.New()
+	vlrouter.anycastMac, _ = net.ParseMAC("00:00:11:11:11:11")
+	vlrouter.unresolvedEPs = cmap.New()
+
+	vlrouter.uplinkPortDb = cmap.New()
 
 	return vlrouter
 }
@@ -92,6 +112,7 @@ func (self *Vlrouter) SwitchConnected(sw *ofctrl.OFSwitch) {
 
 	log.Infof("Switch connected(vlrouter). installing flows")
 
+	self.svcProxy.SwitchConnected(sw)
 	// Tell the policy agent about the switch
 	self.policyAgent.SwitchConnected(sw)
 
@@ -101,11 +122,18 @@ func (self *Vlrouter) SwitchConnected(sw *ofctrl.OFSwitch) {
 
 // Handle switch disconnected notification
 func (self *Vlrouter) SwitchDisconnected(sw *ofctrl.OFSwitch) {
-	// FIXME
+	self.policyAgent.SwitchDisconnected(sw)
+	self.ofSwitch = nil
+
 }
 
 // Handle incoming packet
 func (self *Vlrouter) PacketRcvd(sw *ofctrl.OFSwitch, pkt *ofctrl.PacketIn) {
+	if pkt.TableId == SRV_PROXY_SNAT_TBL_ID || pkt.TableId == SRV_PROXY_DNAT_TBL_ID {
+		// these are destined to service proxy
+		self.svcProxy.HandlePkt(pkt)
+		return
+	}
 	switch pkt.Data.Ethertype {
 	case 0x0806:
 		if (pkt.Match.Type == openflow13.MatchType_OXM) &&
@@ -121,11 +149,66 @@ func (self *Vlrouter) PacketRcvd(sw *ofctrl.OFSwitch, pkt *ofctrl.PacketIn) {
 			}
 		}
 
-	case 0x0800:
-		// FIXME: We dont expect IP packets. Use this for statefull policies.
+	case protocol.IPv4_MSG:
+		var inPort uint32
+		if (pkt.TableId == 0) && (pkt.Match.Type == openflow13.MatchType_OXM) &&
+			(pkt.Match.Fields[0].Class == openflow13.OXM_CLASS_OPENFLOW_BASIC) &&
+			(pkt.Match.Fields[0].Field == openflow13.OXM_FIELD_IN_PORT) {
+			// Get the input port number
+			switch t := pkt.Match.Fields[0].Value.(type) {
+			case *openflow13.InPortField:
+				inPort = t.InPort
+			default:
+				log.Debugf("unknown match type %v for ipv4 pkt", t)
+				return
+			}
+		}
+		ipPkt := pkt.Data.Data.(*protocol.IPv4)
+		switch ipPkt.Protocol {
+		case protocol.Type_UDP:
+			udpPkt := ipPkt.Data.(*protocol.UDP)
+			switch udpPkt.PortDst {
+			case 53:
+				if pkt.Data.VLANID.VID != 0 {
+					self.agent.incrErrStats("dnsPktUplink")
+					return
+				}
+
+				if dnsResp, err := processDNSPkt(self.agent, inPort, udpPkt.Data); err == nil {
+					if respPkt, err := buildUDPRespPkt(&pkt.Data, dnsResp); err == nil {
+						self.agent.incrStats("dnsPktReply")
+						pktOut := openflow13.NewPacketOut()
+						pktOut.Data = respPkt
+						pktOut.AddAction(openflow13.NewActionOutput(inPort))
+						self.ofSwitch.Send(pktOut)
+						return
+					}
+				}
+
+				// re-inject DNS packet
+				ethPkt := buildDnsForwardPkt(&pkt.Data)
+				pktOut := openflow13.NewPacketOut()
+				pktOut.Data = ethPkt
+				pktOut.InPort = inPort
+
+				pktOut.AddAction(openflow13.NewActionOutput(openflow13.P_TABLE))
+				self.agent.incrStats("dnsPktForward")
+				self.ofSwitch.Send(pktOut)
+				return
+			}
+		}
 	default:
 		log.Errorf("Received unknown ethertype: %x", pkt.Data.Ethertype)
 	}
+}
+
+// InjectGARPs not implemented
+func (self *Vlrouter) InjectGARPs(epgID int) {
+}
+
+// GlobalConfigUpdate not implemented
+func (self *Vlrouter) GlobalConfigUpdate(cfg OfnetGlobalConfig) error {
+	return nil
 }
 
 /*AddLocalEndpoint does the following:
@@ -134,50 +217,36 @@ func (self *Vlrouter) PacketRcvd(sw *ofctrl.OFSwitch, pkt *ofctrl.PacketIn) {
 */
 
 func (self *Vlrouter) AddLocalEndpoint(endpoint OfnetEndpoint) error {
-	// Install a flow entry for vlan mapping and point it to IP table
+	log.Infof("Received add Local Endpoint for %v", endpoint)
 	if self.agent.ctrler == nil {
 		return nil
 	}
 
-	portVlanFlow, err := self.vlanTable.NewFlow(ofctrl.FlowMatch{
-		Priority:  FLOW_MATCH_PRIORITY,
-		InputPort: endpoint.PortNo,
-	})
+	dNATTbl := self.ofSwitch.GetTable(SRV_PROXY_DNAT_TBL_ID)
+
+	// Install a flow entry for vlan mapping and point it to next table
+	portVlanFlow, err := createPortVlanFlow(self.agent, self.vlanTable, dNATTbl, &endpoint)
 	if err != nil {
 		log.Errorf("Error creating portvlan entry. Err: %v", err)
-		return err
-	}
-
-	//since only default vrf is supported in bgp.
-
-	vrfid := self.agent.vrfNameIdMap[endpoint.Vrf]
-
-	if vrfid == nil || *vrfid == 0 {
-		log.Errorf("Invalid vrf name:%v", endpoint.Vrf)
-		return errors.New("Invalid vrf name")
-	}
-	//set vrf id as METADATA
-	metadata, metadataMask := Vrfmetadata(*vrfid)
-
-	// Set source endpoint group if specified
-	if endpoint.EndpointGroup != 0 {
-		srcMetadata, srcMetadataMask := SrcGroupMetadata(endpoint.EndpointGroup)
-		metadata = metadata | srcMetadata
-		metadataMask = metadataMask | srcMetadataMask
-	}
-	portVlanFlow.SetMetadata(metadata, metadataMask)
-
-	// Point it to dst group table for policy lookups
-	dstGrpTbl := self.ofSwitch.GetTable(DST_GRP_TBL_ID)
-	err = portVlanFlow.Next(dstGrpTbl)
-	if err != nil {
-		log.Errorf("Error installing portvlan entry. Err: %v", err)
 		return err
 	}
 
 	// save the flow entry
 	self.portVlanFlowDb[endpoint.PortNo] = portVlanFlow
 
+	// install DSCP flow entries if required
+	if endpoint.Dscp != 0 {
+		dscpV4Flow, dscpV6Flow, err := createDscpFlow(self.agent, self.vlanTable, dNATTbl, &endpoint)
+		if err != nil {
+			log.Errorf("Error installing DSCP flows. Err: %v", err)
+			return err
+		}
+
+		// save it for tracking
+		self.dscpFlowDb[endpoint.PortNo] = []*ofctrl.Flow{dscpV4Flow, dscpV6Flow}
+	}
+
+	// get output flow
 	outPort, err := self.ofSwitch.OutputPort(endpoint.PortNo)
 	if err != nil {
 		log.Errorf("Error creating output port %d. Err: %v", endpoint.PortNo, err)
@@ -195,41 +264,46 @@ func (self *Vlrouter) AddLocalEndpoint(endpoint OfnetEndpoint) error {
 		log.Errorf("Error creating flow for endpoint: %+v. Err: %v", endpoint, err)
 		return err
 	}
-
 	destMacAddr, _ := net.ParseMAC(endpoint.MacAddrStr)
 
 	// Set Mac addresses
 	ipFlow.SetMacDa(destMacAddr)
-	ipFlow.SetMacSa(self.myRouterMac)
+	ipFlow.SetMacSa(self.anycastMac)
 
 	// Point the route at output port
 	err = ipFlow.Next(outPort)
 	if err != nil {
-		log.Errorf("Error installing flow for endpoint: %+v. Err: %v", endpoint, err)
+		log.Errorf("Error installing IP flow for endpoint: %+v. Err: %v", endpoint, err)
 		return err
 	}
 
 	// Store the flow
-	self.flowDb[endpoint.IpAddr.String()] = ipFlow
+	flowId := self.agent.getEndpointIdByIpVlan(endpoint.IpAddr, endpoint.Vlan)
+	self.flowDb[flowId] = ipFlow
 
-	if endpoint.EndpointType == "internal-bgp" {
-		return nil
+	if endpoint.EndpointType != "internal-bgp" {
+		// Install dst group entry for the endpoint
+		err = self.policyAgent.AddEndpoint(&endpoint)
+		if err != nil {
+			log.Errorf("Error adding endpoint to policy agent{%+v}. Err: %v", endpoint, err)
+			return err
+		}
+		path := &OfnetProtoRouteInfo{
+			ProtocolType: "bgp",
+			localEpIP:    endpoint.IpAddr.String(),
+			nextHopIP:    "",
+		}
+		if self.agent.GetRouterInfo() != nil {
+			path.nextHopIP = self.agent.GetRouterInfo().RouterIP
+		}
+		self.agent.AddLocalProtoRoute([]*OfnetProtoRouteInfo{path})
 	}
-
-	// Install dst group entry for the endpoint
-	err = self.policyAgent.AddEndpoint(&endpoint)
-	if err != nil {
-		log.Errorf("Error adding endpoint to policy agent{%+v}. Err: %v", endpoint, err)
-		return err
+	if endpoint.Ipv6Addr != nil && endpoint.Ipv6Addr.String() != "" {
+		err = self.AddLocalIpv6Flow(endpoint)
+		if err != nil {
+			return err
+		}
 	}
-
-	path := &OfnetProtoRouteInfo{
-		ProtocolType: "bgp",
-		localEpIP:    endpoint.IpAddr.String(),
-		nextHopIP:    self.agent.GetRouterInfo().RouterIP,
-	}
-	self.agent.AddLocalProtoRoute(path)
-
 	return nil
 }
 
@@ -239,6 +313,7 @@ func (self *Vlrouter) AddLocalEndpoint(endpoint OfnetEndpoint) error {
 */
 func (self *Vlrouter) RemoveLocalEndpoint(endpoint OfnetEndpoint) error {
 
+	log.Infof("Received Remove Local Endpoint for endpoint:{%+v}", endpoint)
 	// Remove the port vlan flow.
 	portVlanFlow := self.portVlanFlowDb[endpoint.PortNo]
 	if portVlanFlow != nil {
@@ -248,8 +323,21 @@ func (self *Vlrouter) RemoveLocalEndpoint(endpoint OfnetEndpoint) error {
 		}
 	}
 
+	// Remove dscp flows.
+	dscpFlows, found := self.dscpFlowDb[endpoint.PortNo]
+	if found {
+		for _, dflow := range dscpFlows {
+			err := dflow.Delete()
+			if err != nil {
+				log.Errorf("Error deleting dscp flow {%+v}. Err: %v", dflow, err)
+			}
+		}
+	}
+
 	// Find the flow entry
-	ipFlow := self.flowDb[endpoint.IpAddr.String()]
+	//flowId := self.agent.getEndpointIdByIpVlan(endpoint.IpAddr, endpoint.Vlan)
+	flowId := endpoint.EndpointID
+	ipFlow := self.flowDb[flowId]
 	if ipFlow == nil {
 		log.Errorf("Error finding the flow for endpoint: %+v", endpoint)
 		return errors.New("Flow not found")
@@ -261,6 +349,8 @@ func (self *Vlrouter) RemoveLocalEndpoint(endpoint OfnetEndpoint) error {
 		log.Errorf("Error deleting the endpoint: %+v. Err: %v", endpoint, err)
 	}
 
+	self.svcProxy.DelEndpoint(&endpoint)
+
 	// Remove the endpoint from policy tables
 	if endpoint.EndpointType != "internal-bgp" {
 		err = self.policyAgent.DelEndpoint(&endpoint)
@@ -269,13 +359,161 @@ func (self *Vlrouter) RemoveLocalEndpoint(endpoint OfnetEndpoint) error {
 			return err
 		}
 	}
+
 	path := &OfnetProtoRouteInfo{
 		ProtocolType: "bgp",
 		localEpIP:    endpoint.IpAddr.String(),
-		nextHopIP:    self.agent.GetRouterInfo().RouterIP,
+		nextHopIP:    "",
+	}
+	if self.agent.GetRouterInfo() != nil {
+		path.nextHopIP = self.agent.GetRouterInfo().RouterIP
+	}
+	self.agent.DeleteLocalProtoRoute([]*OfnetProtoRouteInfo{path})
+
+	if endpoint.Ipv6Addr != nil && endpoint.Ipv6Addr.String() != "" {
+		err = self.RemoveLocalIpv6Flow(endpoint)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// UpdateLocalEndpoint update local endpoint state
+func (self *Vlrouter) UpdateLocalEndpoint(endpoint *OfnetEndpoint, epInfo EndpointInfo) error {
+	oldDscp := endpoint.Dscp
+
+	// Remove existing DSCP flows if required
+	if epInfo.Dscp == 0 || epInfo.Dscp != endpoint.Dscp {
+		// remove old DSCP flows
+		dscpFlows, found := self.dscpFlowDb[endpoint.PortNo]
+		if found {
+			for _, dflow := range dscpFlows {
+				err := dflow.Delete()
+				if err != nil {
+					log.Errorf("Error deleting dscp flow {%+v}. Err: %v", dflow, err)
+					return err
+				}
+			}
+		}
 	}
 
-	self.agent.DeleteLocalProtoRoute(path)
+	// change DSCP value
+	endpoint.Dscp = epInfo.Dscp
+
+	// Add new DSCP flows if required
+	if epInfo.Dscp != 0 && epInfo.Dscp != oldDscp {
+		dNATTbl := self.ofSwitch.GetTable(SRV_PROXY_DNAT_TBL_ID)
+
+		// add new dscp flows
+		dscpV4Flow, dscpV6Flow, err := createDscpFlow(self.agent, self.vlanTable, dNATTbl, endpoint)
+		if err != nil {
+			log.Errorf("Error installing DSCP flows. Err: %v", err)
+			return err
+		}
+
+		// save it for tracking
+		self.dscpFlowDb[endpoint.PortNo] = []*ofctrl.Flow{dscpV4Flow, dscpV6Flow}
+	}
+
+	return nil
+}
+
+// Add IPv6 flows
+func (self *Vlrouter) AddLocalIpv6Flow(endpoint OfnetEndpoint) error {
+
+	outPort, err := self.ofSwitch.OutputPort(endpoint.PortNo)
+	if err != nil {
+		log.Errorf("Error creating output port %d. Err: %v", endpoint.PortNo, err)
+		return err
+	}
+
+	// Install the IPv6 address
+	ipv6Flow, err := self.ipTable.NewFlow(ofctrl.FlowMatch{
+		Priority:  FLOW_MATCH_PRIORITY,
+		Ethertype: 0x86DD,
+		Ipv6Da:    &endpoint.Ipv6Addr,
+	})
+
+	if err != nil {
+		log.Errorf("Error creating IPv6 flow for endpoint: %+v. Err: %v", endpoint, err)
+		return err
+	}
+
+	destMacAddr, _ := net.ParseMAC(endpoint.MacAddrStr)
+
+	// Set Mac addresses
+	ipv6Flow.SetMacDa(destMacAddr)
+	ipv6Flow.SetMacSa(self.anycastMac)
+
+	// Point the route at output port
+	err = ipv6Flow.Next(outPort)
+	if err != nil {
+		log.Errorf("Error installing IPv6 flow for endpoint: %+v. Err: %v", endpoint, err)
+		return err
+	}
+
+	// Store the flow
+	flowId := self.agent.getEndpointIdByIpVlan(endpoint.Ipv6Addr, endpoint.Vlan)
+	self.flowDb[flowId] = ipv6Flow
+
+	if endpoint.EndpointType != "internal-bgp" {
+		// Install dst group entry for IPv6 endpoint
+		err = self.policyAgent.AddIpv6Endpoint(&endpoint)
+		if err != nil {
+			log.Errorf("Error adding IPv6 endpoint to policy agent{%+v}. Err: %v", endpoint, err)
+			return err
+		}
+
+		// Add IPv6 route in BGP
+		path := &OfnetProtoRouteInfo{
+			ProtocolType: "bgp",
+			localEpIP:    endpoint.Ipv6Addr.String(),
+			nextHopIP:    "",
+		}
+		if self.agent.GetRouterInfo() != nil {
+			path.nextHopIP = self.agent.GetRouterInfo().RouterIP
+		}
+		self.agent.AddLocalProtoRoute([]*OfnetProtoRouteInfo{path})
+	}
+
+	return nil
+}
+
+// Remove the IPv6 flow
+func (self *Vlrouter) RemoveLocalIpv6Flow(endpoint OfnetEndpoint) error {
+
+	// Find the IPv6 flow entry
+	flowId := self.agent.getEndpointIdByIpVlan(endpoint.Ipv6Addr, endpoint.Vlan)
+	ipv6Flow := self.flowDb[flowId]
+	if ipv6Flow == nil {
+		log.Errorf("Error finding the flow for endpoint: %+v", endpoint)
+		return errors.New("Flow not found")
+	}
+
+	// Delete the Fgraph entry
+	err := ipv6Flow.Delete()
+	if err != nil {
+		log.Errorf("Error deleting IPv6 endpoint: %+v. Err: %v", endpoint, err)
+	}
+
+	// Remove the endpoint from policy tables
+	if endpoint.EndpointType != "internal-bgp" {
+		err = self.policyAgent.DelIpv6Endpoint(&endpoint)
+		if err != nil {
+			log.Errorf("Error deleting IPv6 endpoint from policy agent{%+v}. Err: %v", endpoint, err)
+			return err
+		}
+	}
+	path := &OfnetProtoRouteInfo{
+		ProtocolType: "bgp",
+		localEpIP:    endpoint.Ipv6Addr.String(),
+		nextHopIP:    "",
+	}
+	if self.agent.GetRouterInfo() != nil {
+		path.nextHopIP = self.agent.GetRouterInfo().RouterIP
+	}
+	self.agent.DeleteLocalProtoRoute([]*OfnetProtoRouteInfo{path})
 
 	return nil
 }
@@ -285,7 +523,9 @@ func (self *Vlrouter) RemoveLocalEndpoint(endpoint OfnetEndpoint) error {
 func (self *Vlrouter) AddVlan(vlanId uint16, vni uint32, vrf string) error {
 
 	vrf = "default"
+	self.agent.vlanVrfMutex.Lock()
 	self.agent.vlanVrf[vlanId] = &vrf
+	self.agent.vlanVrfMutex.Unlock()
 	self.agent.createVrf(vrf)
 	return nil
 }
@@ -293,7 +533,9 @@ func (self *Vlrouter) AddVlan(vlanId uint16, vni uint32, vrf string) error {
 // Remove a vlan
 func (self *Vlrouter) RemoveVlan(vlanId uint16, vni uint32, vrf string) error {
 	// FIXME: Add this for multiple VRF support
+	self.agent.vlanVrfMutex.Lock()
 	delete(self.agent.vlanVrf, vlanId)
+	self.agent.vlanVrfMutex.Unlock()
 	self.agent.deleteVrf(vrf)
 	return nil
 }
@@ -307,6 +549,7 @@ func (self *Vlrouter) RemoveVlan(vlanId uint16, vni uint32, vrf string) error {
 */
 func (self *Vlrouter) AddEndpoint(endpoint *OfnetEndpoint) error {
 
+	log.Infof("Received AddEndpoint for endpoint: %+v", endpoint)
 	if endpoint.Vni != 0 {
 		return nil
 	}
@@ -323,16 +566,19 @@ func (self *Vlrouter) AddEndpoint(endpoint *OfnetEndpoint) error {
 			//routes that need to be resolved to next hop.
 			// bgp peer resolution happens via ARP and hence not
 			//maintainer in cache.
-			log.Info("Storing endpoint info in cache")
-			self.unresolvedEPs[endpoint.EndpointID] = endpoint.EndpointID
+			log.Debugf("Storing endpoint info in cache")
+			self.unresolvedEPs.Set(endpoint.EndpointID, endpoint.EndpointID)
+			return nil
 		}
 	}
 	if endpoint.EndpointType == "external-bgp" {
 		self.myBgpPeer = endpoint.IpAddr.String()
+		if endpoint.PortNo == 0 {
+			return nil
+		}
 	}
-	log.Infof("AddEndpoint call for endpoint: %+v", endpoint)
 
-	vrfid := self.agent.vrfNameIdMap[endpoint.Vrf]
+	vrfid := self.agent.getvrfId(endpoint.Vrf)
 	if *vrfid == 0 {
 		log.Errorf("Invalid vrf name:%v", endpoint.Vrf)
 		return errors.New("Invalid vrf name")
@@ -380,8 +626,16 @@ func (self *Vlrouter) AddEndpoint(endpoint *OfnetEndpoint) error {
 		}
 	}
 	// Store it in flow db
-	self.flowDb[endpoint.IpAddr.String()] = ipFlow
+	flowId := self.agent.getEndpointIdByIpVlan(endpoint.IpAddr, endpoint.Vlan)
+	self.flowDb[flowId] = ipFlow
 
+	if endpoint.Ipv6Addr != nil && endpoint.Ipv6Addr.String() != "" {
+		err = self.AddRemoteIpv6Flow(endpoint)
+		if err != nil {
+			log.Errorf("Error adding IPv6 flow for remote endpoint {%+v}. Err: %v", endpoint, err)
+			return err
+		}
+	}
 	return nil
 }
 
@@ -393,10 +647,15 @@ func (self *Vlrouter) RemoveEndpoint(endpoint *OfnetEndpoint) error {
 	}
 
 	//Delete the endpoint if it is in the cache
-	delete(self.unresolvedEPs, endpoint.EndpointID)
+	if _, ok := self.unresolvedEPs.Get(endpoint.EndpointID); ok {
+		self.unresolvedEPs.Remove(endpoint.EndpointID)
+		return nil
+	}
 
 	// Find the flow entry
-	ipFlow := self.flowDb[endpoint.IpAddr.String()]
+	//flowId := self.agent.getEndpointIdByIpVlan(endpoint.IpAddr, endpoint.Vlan)
+	flowId := endpoint.EndpointID
+	ipFlow := self.flowDb[flowId]
 	if ipFlow == nil {
 		log.Errorf("Error finding the flow for endpoint: %+v", endpoint)
 		return errors.New("Flow not found")
@@ -416,6 +675,123 @@ func (self *Vlrouter) RemoveEndpoint(endpoint *OfnetEndpoint) error {
 			return err
 		}
 	}
+	if endpoint.Ipv6Addr != nil && endpoint.Ipv6Addr.String() != "" {
+		err = self.RemoveRemoteIpv6Flow(endpoint)
+		if err != nil {
+			log.Errorf("Error deleting IPv6 endpoint from policy agent{%+v}. Err: %v", endpoint, err)
+			return err
+		}
+	}
+
+	return nil
+}
+
+// Add IPv6 flow for the remote endpoint
+func (self *Vlrouter) AddRemoteIpv6Flow(endpoint *OfnetEndpoint) error {
+	ipv6EpId := self.agent.getEndpointIdByIpVlan(endpoint.Ipv6Addr, endpoint.Vlan)
+
+	nexthopEp := self.agent.getEndpointByIpVrf(net.ParseIP(self.myBgpPeer), "default")
+	if nexthopEp != nil && nexthopEp.PortNo != 0 {
+		endpoint.MacAddrStr = nexthopEp.MacAddrStr
+		endpoint.PortNo = nexthopEp.PortNo
+	} else {
+		endpoint.PortNo = 0
+		endpoint.MacAddrStr = " "
+		if endpoint.EndpointType != "external-bgp" {
+			//for the remote endpoints maintain a cache of
+			//routes that need to be resolved to next hop.
+			// bgp peer resolution happens via ARP and hence not
+			//maintainer in cache.
+			log.Debugf("Storing endpoint info in cache")
+			self.unresolvedEPs.Set(ipv6EpId, ipv6EpId)
+		}
+	}
+	if endpoint.EndpointType == "external-bgp" {
+		self.myBgpPeer = endpoint.IpAddr.String()
+	}
+	log.Infof("AddRemoteIpv6Flow for endpoint: %+v", endpoint)
+
+	vrfid := self.agent.getvrfId(endpoint.Vrf)
+	if *vrfid == 0 {
+		log.Errorf("Invalid vrf name:%v", endpoint.Vrf)
+		return errors.New("Invalid vrf name")
+	}
+
+	//set vrf id as METADATA
+	//metadata, metadataMask := Vrfmetadata(*vrfid)
+
+	outPort, err := self.ofSwitch.OutputPort(endpoint.PortNo)
+	if err != nil {
+		log.Errorf("Error creating output port %d. Err: %v", endpoint.PortNo, err)
+		return err
+	}
+
+	// Install the IP address
+	ipv6Flow, err := self.ipTable.NewFlow(ofctrl.FlowMatch{
+		Priority:   FLOW_MATCH_PRIORITY,
+		Ethertype:  0x86DD,
+		Ipv6Da:     &endpoint.Ipv6Addr,
+		Ipv6DaMask: &endpoint.Ipv6Mask,
+	})
+	if err != nil {
+		log.Errorf("Error creating flow for endpoint: %+v. Err: %v", endpoint, err)
+		return err
+	}
+
+	// Set Mac addresses
+	DAMac, _ := net.ParseMAC(endpoint.MacAddrStr)
+	ipv6Flow.SetMacDa(DAMac)
+	ipv6Flow.SetMacSa(self.myRouterMac)
+
+	// Point it to output port
+	err = ipv6Flow.Next(outPort)
+	if err != nil {
+		log.Errorf("Error installing flow for endpoint: %+v. Err: %v", endpoint, err)
+		return err
+	}
+
+	// Install dst group entry for the endpoint
+	if endpoint.EndpointType == "internal" {
+		err = self.policyAgent.AddIpv6Endpoint(endpoint)
+		if err != nil {
+			log.Errorf("Error adding IPv6 endpoint to policy agent{%+v}. Err: %v", endpoint, err)
+			return err
+		}
+	}
+	// Store it in flow db
+	self.flowDb[ipv6EpId] = ipv6Flow
+
+	return nil
+}
+
+// Remove IPv6 flow for the remote endpoint
+func (self *Vlrouter) RemoveRemoteIpv6Flow(endpoint *OfnetEndpoint) error {
+
+	//Delete the endpoint if it is in the cache
+	ipv6EpId := self.agent.getEndpointIdByIpVlan(endpoint.Ipv6Addr, endpoint.Vlan)
+	self.unresolvedEPs.Remove(ipv6EpId)
+
+	// Find the flow entry
+	ipv6Flow := self.flowDb[ipv6EpId]
+	if ipv6Flow == nil {
+		log.Errorf("Error finding the flow for endpoint: %+v", endpoint)
+		return errors.New("Flow not found")
+	}
+
+	// Delete the Fgraph entry
+	err := ipv6Flow.Delete()
+	if err != nil {
+		log.Errorf("Error deleting the endpoint: %+v. Err: %v", endpoint, err)
+	}
+
+	//Remove the endpoint from policy tables
+	if endpoint.EndpointType == "internal" {
+		err = self.policyAgent.DelIpv6Endpoint(endpoint)
+		if err != nil {
+			log.Errorf("Error deleting IPv6 endpoint from policy agent{%+v}. Err: %v", endpoint, err)
+			return err
+		}
+	}
 
 	return nil
 }
@@ -429,12 +805,19 @@ func (self *Vlrouter) initFgraph() error {
 	self.vlanTable, _ = sw.NewTable(VLAN_TBL_ID)
 	self.ipTable, _ = sw.NewTable(IP_TBL_ID)
 
+	// setup SNAT table
+	// Matches in SNAT table (i.e. incoming) go to IP look up
+	self.svcProxy.InitSNATTable(IP_TBL_ID)
+
 	// Init policy tables
-	err := self.policyAgent.InitTables(IP_TBL_ID)
+	err := self.policyAgent.InitTables(SRV_PROXY_SNAT_TBL_ID)
 	if err != nil {
 		log.Fatalf("Error installing policy table. Err: %v", err)
 		return err
 	}
+
+	// Matches in DNAT go to Policy
+	self.svcProxy.InitDNATTable(DST_GRP_TBL_ID)
 
 	//Create all drop entries
 	// Drop mcast source mac
@@ -445,6 +828,32 @@ func (self *Vlrouter) initFgraph() error {
 		MacSaMask: &bcastMac,
 	})
 	bcastSrcFlow.Next(sw.DropAction())
+
+	// redirect dns requests from containers (oui 02:02:xx) to controller
+	macSaMask := net.HardwareAddr{0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00}
+	macSa := net.HardwareAddr{0x02, 0x02, 0x00, 0x00, 0x00, 0x00}
+	dnsRedirectFlow, _ := self.inputTable.NewFlow(ofctrl.FlowMatch{
+		Priority:   DNS_FLOW_MATCH_PRIORITY,
+		MacSa:      &macSa,
+		MacSaMask:  &macSaMask,
+		Ethertype:  protocol.IPv4_MSG,
+		IpProto:    protocol.Type_UDP,
+		UdpDstPort: 53,
+	})
+	dnsRedirectFlow.Next(sw.SendToController())
+
+	// re-inject dns requests
+	dnsReinjectFlow, _ := self.inputTable.NewFlow(ofctrl.FlowMatch{
+		Priority:   DNS_FLOW_MATCH_PRIORITY + 1,
+		MacSa:      &macSa,
+		MacSaMask:  &macSaMask,
+		VlanId:     nameServerInternalVlanId,
+		Ethertype:  protocol.IPv4_MSG,
+		IpProto:    protocol.Type_UDP,
+		UdpDstPort: 53,
+	})
+	dnsReinjectFlow.PopVlan()
+	dnsReinjectFlow.Next(self.vlanTable)
 
 	// Redirect ARP packets to controller
 	arpFlow, _ := self.inputTable.NewFlow(ofctrl.FlowMatch{
@@ -499,33 +908,54 @@ func (self *Vlrouter) processArp(pkt protocol.Ethernet, inPort uint32) {
 		var arpHdr protocol.ARP = *t
 		var srcMac net.HardwareAddr
 		var intf *net.Interface
+		var err error
+
+		self.agent.incrStats("ArpPktRcvd")
 
 		switch arpHdr.Operation {
 		case protocol.Type_Request:
+			self.agent.incrStats("ArpReqRcvd")
+
 			// Lookup the Dest IP in the endpoint table
 			endpoint := self.agent.getEndpointByIpVrf(arpHdr.IPDst, "default")
 			if endpoint == nil {
-				//If we dont know the IP address, dont send an ARP response
-				log.Infof("Received ARP request for unknown IP: %v ", arpHdr.IPDst)
-				return
+				// Look for a service entry for the target IP
+				proxyMac := self.svcProxy.GetSvcProxyMAC(arpHdr.IPDst)
+				if proxyMac == "" {
+					// If we dont know the IP address, dont send an ARP response
+					log.Debugf("Received ARP request for unknown IP: %v", arpHdr.IPDst)
+					self.agent.incrStats("ArpReqUnknownDest")
+					return
+				}
+				srcMac, _ = net.ParseMAC(proxyMac)
 			} else {
 				if endpoint.EndpointType == "internal" || endpoint.EndpointType == "internal-bgp" {
 					//srcMac, _ = net.ParseMAC(endpoint.MacAddrStr)
-					intf, _ = net.InterfaceByName(self.agent.GetRouterInfo().VlanIntf)
+					if self.agent.GetRouterInfo() != nil {
+						uplink := self.agent.GetRouterInfo().UplinkPort
+						intf, err = net.InterfaceByName(uplink.Name)
+						if err != nil {
+							log.Errorf("Error getting interface information. Err: %+v", err)
+							return
+						}
+					} else {
+						log.Debugf("Uplink intf not present. Ignoring Arp")
+						return
+					}
 					srcMac = intf.HardwareAddr
 				} else if endpoint.EndpointType == "external" || endpoint.EndpointType == "external-bgp" {
 					endpoint = self.agent.getEndpointByIpVrf(arpHdr.IPSrc, "default")
 					if endpoint != nil {
 						if endpoint.EndpointType == "internal" || endpoint.EndpointType == "internal-bgp" {
-							srcMac = self.myRouterMac
+							srcMac = self.anycastMac
 						} else {
+							self.agent.incrStats("ArpReqUnknownEndpointType")
 							return
 						}
-
 					} else {
+						self.agent.incrStats("ArpReqUnknownEndpoint")
 						return
 					}
-
 				}
 			}
 
@@ -536,13 +966,12 @@ func (self *Vlrouter) processArp(pkt protocol.Ethernet, inPort uint32) {
 				if endpoint.PortNo == 0 {
 					log.Infof("Received ARP from BGP Peer on %s: Mac: %s", endpoint.PortNo, endpoint.MacAddrStr)
 					//learn the mac address and portno for the endpoint
-					self.RemoveEndpoint(endpoint)
 					endpoint.PortNo = inPort
 					endpoint.MacAddrStr = arpHdr.HWSrc.String()
-					self.agent.endpointDb[endpoint.EndpointID] = endpoint
+					self.agent.endpointDb.Set(endpoint.EndpointID, endpoint)
 					self.AddEndpoint(endpoint)
 					self.resolveUnresolvedEPs(endpoint.MacAddrStr, inPort)
-
+					self.agent.incrStats("ArpReqRcvdFromBgpPeer")
 				}
 			}
 
@@ -553,7 +982,7 @@ func (self *Vlrouter) processArp(pkt protocol.Ethernet, inPort uint32) {
 			arpResp.HWDst = arpHdr.HWSrc
 			arpResp.IPDst = arpHdr.IPSrc
 
-			log.Infof("Sending ARP response: %+v", arpResp)
+			log.Debugf("Sending ARP response: %+v", arpResp)
 
 			// build the ethernet packet
 			ethPkt := protocol.NewEthernet()
@@ -562,28 +991,31 @@ func (self *Vlrouter) processArp(pkt protocol.Ethernet, inPort uint32) {
 			ethPkt.Ethertype = 0x0806
 			ethPkt.Data = arpResp
 
-			log.Infof("Sending ARP response Ethernet: %+v", ethPkt)
+			log.Debugf("Sending ARP response Ethernet: %+v", ethPkt)
 
 			// Packet out
 			pktOut := openflow13.NewPacketOut()
 			pktOut.Data = ethPkt
 			pktOut.AddAction(openflow13.NewActionOutput(inPort))
 
-			log.Infof("Sending ARP response packet: %+v", pktOut)
+			log.Debugf("Sending ARP response packet: %+v", pktOut)
 
 			// Send it out
 			self.ofSwitch.Send(pktOut)
+			self.agent.incrStats("ArpReqRespSent")
+
 		case protocol.Type_Reply:
+			self.agent.incrStats("ArpRespRcvd")
+
 			endpoint := self.agent.getEndpointByIpVrf(arpHdr.IPSrc, "default")
 			if endpoint != nil && endpoint.EndpointType == "external-bgp" {
 				//endpoint exists from where the arp is received.
 				if endpoint.PortNo == 0 {
 					log.Infof("Received ARP from BGP Peer on %s: Mac: %s", endpoint.PortNo, endpoint.MacAddrStr)
 					//learn the mac address and portno for the endpoint
-					self.RemoveEndpoint(endpoint)
 					endpoint.PortNo = inPort
 					endpoint.MacAddrStr = arpHdr.HWSrc.String()
-					self.agent.endpointDb[endpoint.EndpointID] = endpoint
+					self.agent.endpointDb.Set(endpoint.EndpointID, endpoint)
 					self.AddEndpoint(endpoint)
 					self.resolveUnresolvedEPs(endpoint.MacAddrStr, inPort)
 
@@ -591,10 +1023,11 @@ func (self *Vlrouter) processArp(pkt protocol.Ethernet, inPort uint32) {
 			}
 
 		default:
-			log.Infof("Dropping ARP response packet from port %d", inPort)
+			log.Debugf("Dropping ARP response packet from port %d", inPort)
 		}
 	}
 }
+
 func (self *Vlrouter) AddVtepPort(portNo uint32, remoteIp net.IP) error {
 	return nil
 }
@@ -609,26 +1042,46 @@ over given mac and port*/
 
 func (self *Vlrouter) resolveUnresolvedEPs(MacAddrStr string, portNo uint32) {
 
-	for endpointID, _ := range self.unresolvedEPs {
-		endpoint := self.agent.endpointDb[endpointID]
-		self.RemoveEndpoint(endpoint)
+	for id := range self.unresolvedEPs.IterBuffered() {
+		endpointID := id.Val.(string)
+		endpoint := self.agent.getEndpointByID(endpointID)
 		endpoint.PortNo = portNo
 		endpoint.MacAddrStr = MacAddrStr
-		self.agent.endpointDb[endpoint.EndpointID] = endpoint
+		self.agent.endpointDb.Set(endpoint.EndpointID, endpoint)
 		self.AddEndpoint(endpoint)
-		delete(self.unresolvedEPs, endpointID)
+		self.unresolvedEPs.Remove(endpointID)
 	}
-
 }
 
 // AddUplink adds an uplink to the switch
-func (self *Vlrouter) AddUplink(portNo uint32) error {
-	log.Infof("Adding uplink port: %+v", portNo)
+func (self *Vlrouter) AddUplink(uplinkPort *PortInfo) error {
+	log.Infof("Adding uplink: %+v", uplinkPort)
+
+	if len(uplinkPort.MbrLinks) != 1 {
+		err := fmt.Errorf("Only one uplink interface supported in vlrouter mode. Num uplinks configured: %d", len(uplinkPort.MbrLinks))
+		log.Errorf("Error adding uplink: %+v", err)
+		return err
+	}
+
+	linkInfo := uplinkPort.MbrLinks[0]
+
+	dnsUplinkFlow, err := self.inputTable.NewFlow(ofctrl.FlowMatch{
+		Priority:   DNS_FLOW_MATCH_PRIORITY + 2,
+		InputPort:  linkInfo.OfPort,
+		Ethertype:  protocol.IPv4_MSG,
+		IpProto:    protocol.Type_UDP,
+		UdpDstPort: 53,
+	})
+	if err != nil {
+		log.Errorf("Error creating nameserver flow entry. Err: %v", err)
+		return err
+	}
+	dnsUplinkFlow.Next(self.vlanTable)
 
 	// Install a flow entry for vlan mapping and point it to Mac table
 	portVlanFlow, err := self.vlanTable.NewFlow(ofctrl.FlowMatch{
 		Priority:  FLOW_MATCH_PRIORITY,
-		InputPort: portNo,
+		InputPort: linkInfo.OfPort,
 	})
 	if err != nil {
 		log.Errorf("Error creating portvlan entry. Err: %v", err)
@@ -640,32 +1093,97 @@ func (self *Vlrouter) AddUplink(portNo uint32) error {
 
 	// Packets coming from uplink go thru policy and iptable lookup
 	//FIXME: Change next to Policy table
-	err = portVlanFlow.Next(self.ipTable)
+	sNATTbl := self.ofSwitch.GetTable(SRV_PROXY_SNAT_TBL_ID)
+	portVlanFlow.Next(sNATTbl)
 	if err != nil {
 		log.Errorf("Error installing portvlan entry. Err: %v", err)
 		return err
 	}
 
 	// save the flow entry
-	self.portVlanFlowDb[portNo] = portVlanFlow
+	self.portVlanFlowDb[linkInfo.OfPort] = portVlanFlow
+	self.portDnsFlowDb.Set(fmt.Sprintf("%d", linkInfo.OfPort), dnsUplinkFlow)
 
+	intf, err := net.InterfaceByName(linkInfo.Name)
+	if err != nil {
+		log.Debugf("Unable to update router mac to uplink mac:err", err)
+		return err
+	}
+	self.myRouterMac = intf.HardwareAddr
+
+	self.uplinkPortDb.Set(uplinkPort.Name, uplinkPort)
 	return nil
 }
 
-func (self *Vlrouter) RemoveUplink(portNo uint32) error {
+// UpdateUplink updates uplink info
+func (self *Vlrouter) UpdateUplink(uplinkName string, updates PortUpdates) error {
+	return nil
+}
+
+func (self *Vlrouter) RemoveUplink(uplinkName string) error {
+	uplinkPort := self.GetUplink(uplinkName)
+
+	if uplinkPort == nil {
+		err := fmt.Errorf("Could not get uplink with name: %s", uplinkName)
+		return err
+	}
+
+	for _, link := range uplinkPort.MbrLinks {
+		// Uninstall the flow entry
+		portVlanFlow := self.portVlanFlowDb[link.OfPort]
+		if portVlanFlow != nil {
+			portVlanFlow.Delete()
+			delete(self.portVlanFlowDb, link.OfPort)
+		}
+		if f, ok := self.portDnsFlowDb.Get(fmt.Sprintf("%d", link.OfPort)); ok {
+			if dnsUplinkFlow, ok := f.(*ofctrl.Flow); ok {
+				if err := dnsUplinkFlow.Delete(); err != nil {
+					log.Errorf("Error deleting nameserver flow. Err: %v", err)
+				}
+			}
+		}
+		self.portDnsFlowDb.Remove(fmt.Sprintf("%d", link.OfPort))
+	}
+
+	self.uplinkPortDb.Remove(uplinkName)
 	return nil
 }
 
 // AddSvcSpec adds a service spec to proxy
 func (self *Vlrouter) AddSvcSpec(svcName string, spec *ServiceSpec) error {
-	return nil
+	return self.svcProxy.AddSvcSpec(svcName, spec)
 }
 
 // DelSvcSpec removes a service spec from proxy
 func (self *Vlrouter) DelSvcSpec(svcName string, spec *ServiceSpec) error {
-	return nil
+	return self.svcProxy.DelSvcSpec(svcName, spec)
 }
 
 // SvcProviderUpdate Service Proxy Back End update
 func (self *Vlrouter) SvcProviderUpdate(svcName string, providers []string) {
+	self.svcProxy.ProviderUpdate(svcName, providers)
+}
+
+// GetEndpointStats fetches ep stats
+func (self *Vlrouter) GetEndpointStats() (map[string]*OfnetEndpointStats, error) {
+	return self.svcProxy.GetEndpointStats()
+}
+
+// MultipartReply handles stats reply
+func (self *Vlrouter) MultipartReply(sw *ofctrl.OFSwitch, reply *openflow13.MultipartReply) {
+	if reply.Type == openflow13.MultipartType_Flow {
+		self.svcProxy.FlowStats(reply)
+	}
+}
+
+// InspectState returns current state
+func (self *Vlrouter) InspectState() (interface{}, error) {
+	vlrExport := struct {
+		PolicyAgent *PolicyAgent // Policy agent
+		SvcProxy    interface{}  // Service proxy
+	}{
+		self.policyAgent,
+		self.svcProxy.InspectState(),
+	}
+	return vlrExport, nil
 }

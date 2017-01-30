@@ -18,6 +18,7 @@ package ofnet
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"net/rpc"
 	"strings"
@@ -27,6 +28,7 @@ import (
 	"github.com/shaleman/libOpenflow/protocol"
 
 	log "github.com/Sirupsen/logrus"
+	cmap "github.com/streamrail/concurrent-map"
 )
 
 // VXLAN tables are structured as follows
@@ -53,6 +55,7 @@ type Vxlan struct {
 	agent       *OfnetAgent      // Pointer back to ofnet agent that owns this
 	ofSwitch    *ofctrl.OFSwitch // openflow switch we are talking to
 	policyAgent *PolicyAgent     // Policy agent
+	svcProxy    *ServiceProxy    // Service proxy
 
 	vlanDb map[uint16]*Vlan // Database of known vlans
 
@@ -62,8 +65,13 @@ type Vxlan struct {
 	macDestTable *ofctrl.Table // Destination mac lookup
 
 	// Flow Database
-	macFlowDb      map[string]*ofctrl.Flow // Database of flow entries
-	portVlanFlowDb map[uint32]*ofctrl.Flow // Database of flow entries
+	macFlowDb      map[string]*ofctrl.Flow   // Database of flow entries
+	portVlanFlowDb map[uint32]*ofctrl.Flow   // Database of flow entries
+	portDnsFlowDb  cmap.ConcurrentMap        // Database of flow entries
+	dscpFlowDb     map[uint32][]*ofctrl.Flow // Database of flow entries
+
+	// Arp Flow
+	arpRedirectFlow *ofctrl.Flow // ARP redirect flow entry
 }
 
 // Vlan info
@@ -88,6 +96,8 @@ func NewVxlan(agent *OfnetAgent, rpcServ *rpc.Server) *Vxlan {
 	// Keep a reference to the agent
 	vxlan.agent = agent
 
+	vxlan.svcProxy = NewServiceProxy(agent)
+
 	// Create policy agent
 	vxlan.policyAgent = NewPolicyAgent(agent, rpcServ)
 
@@ -95,6 +105,8 @@ func NewVxlan(agent *OfnetAgent, rpcServ *rpc.Server) *Vxlan {
 	vxlan.vlanDb = make(map[uint16]*Vlan)
 	vxlan.macFlowDb = make(map[string]*ofctrl.Flow)
 	vxlan.portVlanFlowDb = make(map[uint32]*ofctrl.Flow)
+	vxlan.portDnsFlowDb = cmap.New()
+	vxlan.dscpFlowDb = make(map[uint32][]*ofctrl.Flow)
 
 	return vxlan
 }
@@ -110,6 +122,7 @@ func (self *Vxlan) SwitchConnected(sw *ofctrl.OFSwitch) {
 	// Keep a reference to the switch
 	self.ofSwitch = sw
 
+	self.svcProxy.SwitchConnected(sw)
 	// Tell the policy agent about the switch
 	self.policyAgent.SwitchConnected(sw)
 
@@ -121,11 +134,20 @@ func (self *Vxlan) SwitchConnected(sw *ofctrl.OFSwitch) {
 
 // Handle switch disconnected notification
 func (self *Vxlan) SwitchDisconnected(sw *ofctrl.OFSwitch) {
-	// FIXME: ??
+
+	self.policyAgent.SwitchDisconnected(sw)
+	self.ofSwitch = nil
+
 }
 
 // Handle incoming packet
 func (self *Vxlan) PacketRcvd(sw *ofctrl.OFSwitch, pkt *ofctrl.PacketIn) {
+	if pkt.TableId == SRV_PROXY_SNAT_TBL_ID || pkt.TableId == SRV_PROXY_DNAT_TBL_ID {
+		// these are destined to service proxy
+		self.svcProxy.HandlePkt(pkt)
+		return
+	}
+
 	switch pkt.Data.Ethertype {
 	case 0x0806:
 		if (pkt.Match.Type == openflow13.MatchType_OXM) &&
@@ -140,52 +162,109 @@ func (self *Vxlan) PacketRcvd(sw *ofctrl.OFSwitch, pkt *ofctrl.PacketIn) {
 				self.processArp(pkt.Data, inPortFld.InPort)
 			}
 		}
+
+	case protocol.IPv4_MSG:
+		var inPort uint32
+		if (pkt.TableId == 0) && (pkt.Match.Type == openflow13.MatchType_OXM) &&
+			(pkt.Match.Fields[0].Class == openflow13.OXM_CLASS_OPENFLOW_BASIC) &&
+			(pkt.Match.Fields[0].Field == openflow13.OXM_FIELD_IN_PORT) {
+
+			// get the input port number
+			switch t := pkt.Match.Fields[0].Value.(type) {
+			case *openflow13.InPortField:
+				inPort = t.InPort
+			default:
+				log.Debugf("unknown match type %v for ipv4 pkt", t)
+				return
+			}
+		}
+
+		ipPkt := pkt.Data.Data.(*protocol.IPv4)
+		switch ipPkt.Protocol {
+		case protocol.Type_UDP:
+			udpPkt := ipPkt.Data.(*protocol.UDP)
+			switch udpPkt.PortDst {
+			case 53:
+				isVtepPort := self.isVtepPort(inPort)
+				if isVtepPort {
+					self.agent.incrErrStats("dnsPktVtep")
+					return
+				}
+
+				if dnsResp, err := processDNSPkt(self.agent, inPort, udpPkt.Data); err == nil {
+					if respPkt, err := buildUDPRespPkt(&pkt.Data, dnsResp); err == nil {
+						self.agent.incrStats("dnsPktReply")
+						pktOut := openflow13.NewPacketOut()
+						pktOut.Data = respPkt
+						pktOut.AddAction(openflow13.NewActionOutput(inPort))
+						self.ofSwitch.Send(pktOut)
+						return
+					}
+				}
+
+				// re-inject DNS packet
+				ethPkt := buildDnsForwardPkt(&pkt.Data)
+				pktOut := openflow13.NewPacketOut()
+				pktOut.Data = ethPkt
+				pktOut.InPort = inPort
+
+				pktOut.AddAction(openflow13.NewActionOutput(openflow13.P_TABLE))
+				self.agent.incrStats("dnsPktForward")
+				self.ofSwitch.Send(pktOut)
+				return
+			}
+		}
 	}
+}
+
+// InjectGARPs not implemented
+func (self *Vxlan) InjectGARPs(epgID int) {
+}
+
+// Update global config
+func (self *Vxlan) GlobalConfigUpdate(cfg OfnetGlobalConfig) error {
+	if self.agent.arpMode == cfg.ArpMode {
+		log.Warnf("no change in ARP mode %s", self.agent.arpMode)
+	} else {
+		self.agent.arpMode = cfg.ArpMode
+		self.updateArpRedirectFlow(self.agent.arpMode)
+	}
+	return nil
 }
 
 // Add a local endpoint and install associated local route
 func (self *Vxlan) AddLocalEndpoint(endpoint OfnetEndpoint) error {
-	log.Infof("Adding localEndpoint: %+v", endpoint)
+	log.Infof("Adding local endpoint: %+v", endpoint)
 
-	vni := self.agent.vlanVniMap[endpoint.Vlan]
+	vni := self.agent.getvlanVniMap(endpoint.Vlan)
 	if vni == nil {
 		log.Errorf("VNI for vlan %d is not known", endpoint.Vlan)
 		return errors.New("Unknown Vlan")
 	}
 
+	dNATTbl := self.ofSwitch.GetTable(SRV_PROXY_DNAT_TBL_ID)
+
 	// Install a flow entry for vlan mapping and point it to Mac table
-	portVlanFlow, err := self.vlanTable.NewFlow(ofctrl.FlowMatch{
-		Priority:  FLOW_MATCH_PRIORITY,
-		InputPort: endpoint.PortNo,
-	})
+	portVlanFlow, err := createPortVlanFlow(self.agent, self.vlanTable, dNATTbl, &endpoint)
 	if err != nil {
 		log.Errorf("Error creating portvlan entry. Err: %v", err)
 		return err
 	}
 
-	vrfid := self.agent.vrfNameIdMap[endpoint.Vrf]
-	//set vrf id as METADATA
-	metadata, metadataMask := Vrfmetadata(*vrfid)
-
-	if endpoint.EndpointGroup != 0 {
-		srcMetadata, srcMetadataMask := SrcGroupMetadata(endpoint.EndpointGroup)
-		metadata = metadata | srcMetadata
-		metadataMask = metadataMask | srcMetadataMask
-
-	}
-	portVlanFlow.SetMetadata(metadata, metadataMask)
-
-	// Set the vlan and install it
-	portVlanFlow.SetVlan(endpoint.Vlan)
-	dstGrpTbl := self.ofSwitch.GetTable(DST_GRP_TBL_ID)
-	err = portVlanFlow.Next(dstGrpTbl)
-	if err != nil {
-		log.Errorf("Error installing portvlan entry. Err: %v", err)
-		return err
-	}
-
 	// save the flow entry
 	self.portVlanFlowDb[endpoint.PortNo] = portVlanFlow
+
+	// install DSCP flow entries if required
+	if endpoint.Dscp != 0 {
+		dscpV4Flow, dscpV6Flow, err := createDscpFlow(self.agent, self.vlanTable, dNATTbl, &endpoint)
+		if err != nil {
+			log.Errorf("Error installing DSCP flows. Err: %v", err)
+			return err
+		}
+
+		// save it for tracking
+		self.dscpFlowDb[endpoint.PortNo] = []*ofctrl.Flow{dscpV4Flow, dscpV6Flow}
+	}
 
 	// Add the port to local and remote flood list
 	output, err := self.ofSwitch.OutputPort(endpoint.PortNo)
@@ -225,6 +304,15 @@ func (self *Vxlan) AddLocalEndpoint(endpoint OfnetEndpoint) error {
 		return err
 	}
 
+	// Install dst group entry for IPv6 endpoint
+	if endpoint.Ipv6Addr != nil {
+		err = self.policyAgent.AddIpv6Endpoint(&endpoint)
+		if err != nil {
+			log.Errorf("Error adding IPv6 endpoint to policy agent{%+v}. Err: %v", endpoint, err)
+			return err
+		}
+	}
+
 	// Save the flow in DB
 	self.macFlowDb[endpoint.MacAddrStr] = macFlow
 
@@ -242,7 +330,13 @@ func (self *Vxlan) AddLocalEndpoint(endpoint OfnetEndpoint) error {
 func (self *Vxlan) RemoveLocalEndpoint(endpoint OfnetEndpoint) error {
 	log.Infof("Received Remove local endpont {%v}", endpoint)
 	// Remove the port from flood lists
-	vlanId := self.agent.vniVlanMap[endpoint.Vni]
+	var vlanId *uint16
+
+	if vlanId = self.agent.getvniVlanMap(endpoint.Vni); vlanId == nil {
+		log.Errorf("Invalid vni to vlan mapping for vni:%v", endpoint.Vni)
+		return errors.New("Invalid vni to vlan mapping")
+	}
+
 	vlan := self.vlanDb[*vlanId]
 	output, err := self.ofSwitch.OutputPort(endpoint.PortNo)
 	if err == nil {
@@ -259,6 +353,17 @@ func (self *Vxlan) RemoveLocalEndpoint(endpoint OfnetEndpoint) error {
 		}
 	}
 
+	// Remove dscp flows.
+	dscpFlows, found := self.dscpFlowDb[endpoint.PortNo]
+	if found {
+		for _, dflow := range dscpFlows {
+			err := dflow.Delete()
+			if err != nil {
+				log.Errorf("Error deleting dscp flow {%+v}. Err: %v", dflow, err)
+			}
+		}
+	}
+
 	// find the flow
 	macFlow := self.macFlowDb[endpoint.MacAddrStr]
 	if macFlow == nil {
@@ -272,11 +377,62 @@ func (self *Vxlan) RemoveLocalEndpoint(endpoint OfnetEndpoint) error {
 		log.Errorf("Error deleting mac flow: %+v. Err: %v", macFlow, err)
 	}
 
+	self.svcProxy.DelEndpoint(&endpoint)
+
 	// Remove the endpoint from policy tables
 	err = self.policyAgent.DelEndpoint(&endpoint)
 	if err != nil {
 		log.Errorf("Error deleting endpoint to policy agent{%+v}. Err: %v", endpoint, err)
 		return err
+	}
+
+	// Remove IPv6 endpoint from policy tables
+	if endpoint.Ipv6Addr != nil {
+		err = self.policyAgent.DelIpv6Endpoint(&endpoint)
+		if err != nil {
+			log.Errorf("Error deleting IPv6 endpoint from policy agent{%+v}. Err: %v", endpoint, err)
+			return err
+		}
+	}
+
+	return nil
+}
+
+// UpdateLocalEndpoint update local endpoint state
+func (self *Vxlan) UpdateLocalEndpoint(endpoint *OfnetEndpoint, epInfo EndpointInfo) error {
+	oldDscp := endpoint.Dscp
+
+	// Remove existing DSCP flows if required
+	if epInfo.Dscp == 0 || epInfo.Dscp != endpoint.Dscp {
+		// remove old DSCP flows
+		dscpFlows, found := self.dscpFlowDb[endpoint.PortNo]
+		if found {
+			for _, dflow := range dscpFlows {
+				err := dflow.Delete()
+				if err != nil {
+					log.Errorf("Error deleting dscp flow {%+v}. Err: %v", dflow, err)
+					return err
+				}
+			}
+		}
+	}
+
+	// change DSCP value
+	endpoint.Dscp = epInfo.Dscp
+
+	// Add new DSCP flows if required
+	if epInfo.Dscp != 0 && epInfo.Dscp != oldDscp {
+		dNATTbl := self.ofSwitch.GetTable(SRV_PROXY_DNAT_TBL_ID)
+
+		// add new dscp flows
+		dscpV4Flow, dscpV6Flow, err := createDscpFlow(self.agent, self.vlanTable, dNATTbl, endpoint)
+		if err != nil {
+			log.Errorf("Error installing DSCP flows. Err: %v", err)
+			return err
+		}
+
+		// save it for tracking
+		self.dscpFlowDb[endpoint.PortNo] = []*ofctrl.Flow{dscpV4Flow, dscpV6Flow}
 	}
 
 	return nil
@@ -285,7 +441,24 @@ func (self *Vxlan) RemoveLocalEndpoint(endpoint OfnetEndpoint) error {
 // Add virtual tunnel end point. This is mainly used for mapping remote vtep IP
 // to ofp port number.
 func (self *Vxlan) AddVtepPort(portNo uint32, remoteIp net.IP) error {
+
+	dnsVtepFlow, err := self.inputTable.NewFlow(ofctrl.FlowMatch{
+		Priority:   DNS_FLOW_MATCH_PRIORITY + 2,
+		InputPort:  portNo,
+		Ethertype:  protocol.IPv4_MSG,
+		IpProto:    protocol.Type_UDP,
+		UdpDstPort: 53,
+	})
+	if err != nil {
+		log.Errorf("Error creating nameserver flow entry. Err: %v", err)
+		return err
+	}
+	dnsVtepFlow.Next(self.vlanTable)
+	self.portDnsFlowDb.Set(fmt.Sprintf("%d", portNo), dnsVtepFlow)
+
 	// Install VNI to vlan mapping for each vni
+	sNATTbl := self.ofSwitch.GetTable(SRV_PROXY_SNAT_TBL_ID)
+	self.agent.vlanVniMutex.RLock()
 	for vni, vlan := range self.agent.vniVlanMap {
 		// Install a flow entry for  VNI/vlan and point it to macDest table
 		portVlanFlow, err := self.vlanTable.NewFlow(ofctrl.FlowMatch{
@@ -295,16 +468,27 @@ func (self *Vxlan) AddVtepPort(portNo uint32, remoteIp net.IP) error {
 		})
 		if err != nil && strings.Contains(err.Error(), "Flow already exists") {
 			log.Infof("VTEP %s already exists", remoteIp.String())
+			self.agent.vlanVniMutex.RUnlock()
 			return nil
 		} else if err != nil {
 			log.Errorf("Error adding Flow for VNI %d. Err: %v", vni, err)
+			self.agent.vlanVniMutex.RUnlock()
 			return err
 		}
 		portVlanFlow.SetVlan(*vlan)
 		// Set the metadata to indicate packet came in from VTEP port
 
-		vrf := self.agent.vlanVrf[*vlan]
-		vrfid := self.agent.vrfNameIdMap[*vrf]
+		var vrfid *uint16
+		if vrf := self.agent.getvlanVrf(*vlan); vrf != nil {
+			vrfid = self.agent.getvrfId(*vrf)
+			if vrfid == nil {
+				self.agent.vlanVniMutex.RUnlock()
+				return fmt.Errorf("Invalid vrf id for vrf:%s", *vrf)
+			}
+		} else {
+			self.agent.vlanVniMutex.RUnlock()
+			return fmt.Errorf("Unable to find vrf for vlan %v", *vlan)
+		}
 		//set vrf id as METADATA
 		vrfmetadata, vrfmetadataMask := Vrfmetadata(*vrfid)
 
@@ -315,15 +499,16 @@ func (self *Vxlan) AddVtepPort(portNo uint32, remoteIp net.IP) error {
 
 		// Point to next table
 		// Note that we bypass policy lookup on dest host.
-		portVlanFlow.Next(self.macDestTable)
+		portVlanFlow.Next(sNATTbl)
 
 		// save the port vlan flow for cleaning up later
 		self.vlanDb[*vlan].vtepVlanFlowDb[portNo] = portVlanFlow
 	}
+	self.agent.vlanVniMutex.RUnlock()
 
 	// Walk all vlans and add vtep port to the vlan
 	for vlanId, vlan := range self.vlanDb {
-		vni := self.agent.vlanVniMap[vlanId]
+		vni := self.agent.getvlanVniMap(vlanId)
 		if vni == nil {
 			log.Errorf("Can not find vni for vlan: %d", vlanId)
 		}
@@ -335,11 +520,13 @@ func (self *Vxlan) AddVtepPort(portNo uint32, remoteIp net.IP) error {
 	}
 
 	// walk all routes and see if we need to install it
-	for _, endpoint := range self.agent.endpointDb {
-		if endpoint.OriginatorIp.String() == remoteIp.String() {
-			err := self.AddEndpoint(endpoint)
+	var ep *OfnetEndpoint
+	for endpoint := range self.agent.endpointDb.IterBuffered() {
+		ep = endpoint.Val.(*OfnetEndpoint)
+		if ep.OriginatorIp.String() == remoteIp.String() {
+			err := self.AddEndpoint(ep)
 			if err != nil {
-				log.Errorf("Error installing endpoint during vtep add(%v) EP: %+v. Err: %v", remoteIp, endpoint, err)
+				log.Errorf("Error installing endpoint during vtep add(%v) EP: %+v. Err: %v", remoteIp, ep, err)
 				return err
 			}
 		}
@@ -350,22 +537,35 @@ func (self *Vxlan) AddVtepPort(portNo uint32, remoteIp net.IP) error {
 
 // Remove a VTEP port
 func (self *Vxlan) RemoveVtepPort(portNo uint32, remoteIp net.IP) error {
+	if f, ok := self.portDnsFlowDb.Get(fmt.Sprintf("%d", portNo)); ok {
+		if dnsVtepFlow, ok := f.(*ofctrl.Flow); ok {
+			if err := dnsVtepFlow.Delete(); err != nil {
+				log.Errorf("Error deleting nameserver flow. Err: %v", err)
+			}
+		}
+	}
+	self.portDnsFlowDb.Remove(fmt.Sprintf("%d", portNo))
+
 	// Remove the VTEP from flood lists
 	output, _ := self.ofSwitch.OutputPort(portNo)
 	for _, vlan := range self.vlanDb {
 		// Walk all vlans and remove from flood lists
 		vlan.allFlood.RemoveOutput(output)
+
+		portVlanFlow := vlan.vtepVlanFlowDb[portNo]
+		portVlanFlow.Delete()
+		delete(vlan.vtepVlanFlowDb, portNo)
 	}
-
-	// FIXME: uninstall vlan-vni mapping.
-
 	return nil
 }
 
 // Add a vlan.
 func (self *Vxlan) AddVlan(vlanId uint16, vni uint32, vrf string) error {
 	var err error
+	self.agent.vlanVrfMutex.Lock()
 	self.agent.vlanVrf[vlanId] = &vrf
+	self.agent.vlanVrfMutex.Unlock()
+
 	self.agent.createVrf(vrf)
 	// check if the vlan already exists. if it does, we are done
 	if self.vlanDb[vlanId] != nil {
@@ -390,6 +590,7 @@ func (self *Vxlan) AddVlan(vlanId uint16, vni uint32, vrf string) error {
 	}
 
 	// Walk all VTEP ports and add vni-vlan mapping for new VNI
+	self.agent.vtepTableMutex.RLock()
 	for _, vtepPort := range self.agent.vtepTable {
 		// Install a flow entry for  VNI/vlan and point it to macDest table
 		portVlanFlow, err := self.vlanTable.NewFlow(ofctrl.FlowMatch{
@@ -399,6 +600,7 @@ func (self *Vxlan) AddVlan(vlanId uint16, vni uint32, vrf string) error {
 		})
 		if err != nil {
 			log.Errorf("Error creating port vlan flow for vlan %d. Err: %v", vlanId, err)
+			self.agent.vtepTableMutex.RUnlock()
 			return err
 		}
 
@@ -406,8 +608,17 @@ func (self *Vxlan) AddVlan(vlanId uint16, vni uint32, vrf string) error {
 		portVlanFlow.SetVlan(vlanId)
 
 		// Set the metadata to indicate packet came in from VTEP port
-		vrf := self.agent.vlanVrf[vlanId]
-		vrfid := self.agent.vrfNameIdMap[*vrf]
+		var vrfid *uint16
+		if vrf := self.agent.getvlanVrf(vlanId); vrf != nil {
+			vrfid = self.agent.getvrfId(*vrf)
+			if vrfid == nil {
+				self.agent.vtepTableMutex.RUnlock()
+				return fmt.Errorf("Invalid vrf id for vrf:%s", *vrf)
+			}
+		} else {
+			self.agent.vtepTableMutex.RUnlock()
+			return fmt.Errorf("Unable to find vrf for vlan %v", *vlan)
+		}
 		//set vrf id as METADATA
 		vrfmetadata, vrfmetadataMask := Vrfmetadata(*vrfid)
 
@@ -428,10 +639,12 @@ func (self *Vxlan) AddVlan(vlanId uint16, vni uint32, vrf string) error {
 	for _, vtepPort := range self.agent.vtepTable {
 		output, err := self.ofSwitch.OutputPort(*vtepPort)
 		if err != nil {
+			self.agent.vtepTableMutex.RUnlock()
 			return err
 		}
 		vlan.allFlood.AddTunnelOutput(output, uint64(vni))
 	}
+	self.agent.vtepTableMutex.RUnlock()
 
 	log.Infof("Installing vlan flood entry for vlan: %d", vlanId)
 
@@ -470,8 +683,10 @@ func (self *Vxlan) AddVlan(vlanId uint16, vni uint32, vrf string) error {
 
 	// store it in DB
 	self.vlanDb[vlanId] = vlan
-
+	self.agent.vrfMutex.Lock()
 	self.agent.vlanVrf[vlanId] = &vrf
+	self.agent.vrfMutex.Unlock()
+
 	self.agent.createVrf(vrf)
 	return nil
 }
@@ -506,7 +721,9 @@ func (self *Vxlan) RemoveVlan(vlanId uint16, vni uint32, vrf string) error {
 
 	// Remove it from DB
 	delete(self.vlanDb, vlanId)
+	self.agent.vlanVrfMutex.Lock()
 	delete(self.agent.vlanVrf, vlanId)
+	self.agent.vlanVrfMutex.Unlock()
 	self.agent.deleteVrf(vrf)
 	return nil
 }
@@ -521,7 +738,7 @@ func (self *Vxlan) AddEndpoint(endpoint *OfnetEndpoint) error {
 	log.Infof("Received endpoint: %+v", endpoint)
 
 	// Lookup the VTEP for the endpoint
-	vtepPort := self.agent.vtepTable[endpoint.OriginatorIp.String()]
+	vtepPort := self.agent.getvtepTablePort(endpoint.OriginatorIp.String())
 	if vtepPort == nil {
 		log.Warnf("Could not find the VTEP for endpoint: %+v", endpoint)
 
@@ -531,7 +748,7 @@ func (self *Vxlan) AddEndpoint(endpoint *OfnetEndpoint) error {
 	}
 
 	// map VNI to vlan Id
-	vlanId := self.agent.vniVlanMap[endpoint.Vni]
+	vlanId := self.agent.getvniVlanMap(endpoint.Vni)
 	if vlanId == nil {
 		log.Errorf("Endpoint %+v on unknown VNI: %d", endpoint, endpoint.Vni)
 		return errors.New("Unknown VNI")
@@ -572,6 +789,15 @@ func (self *Vxlan) AddEndpoint(endpoint *OfnetEndpoint) error {
 		return err
 	}
 
+	// Install dst group entry for IPv6 endpoint
+	if endpoint.Ipv6Addr != nil {
+		err = self.policyAgent.AddIpv6Endpoint(endpoint)
+		if err != nil {
+			log.Errorf("Error adding IPv6 endpoint to policy agent{%+v}. Err: %v", endpoint, err)
+			return err
+		}
+	}
+
 	// Save the flow in DB
 	self.macFlowDb[endpoint.MacAddrStr] = macFlow
 	return nil
@@ -606,31 +832,72 @@ func (self *Vxlan) RemoveEndpoint(endpoint *OfnetEndpoint) error {
 		return err
 	}
 
+	// Remove the endpoint from policy tables
+	if endpoint.Ipv6Addr != nil {
+		err = self.policyAgent.DelIpv6Endpoint(endpoint)
+		if err != nil {
+			log.Errorf("Error deleting IPv6 endpoint from policy agent{%+v}. Err: %v", endpoint, err)
+			return err
+		}
+	}
+
 	return nil
 }
 
 // AddUplink adds an uplink to the switch
-func (vx *Vxlan) AddUplink(portNo uint32) error {
+func (vx *Vxlan) AddUplink(uplinkPort *PortInfo) error {
+	return nil
+}
+
+// UpdateUplink updates uplink info
+func (vx *Vxlan) UpdateUplink(uplinkName string, updates PortUpdates) error {
 	return nil
 }
 
 // RemoveUplink remove an uplink to the switch
-func (vx *Vxlan) RemoveUplink(portNo uint32) error {
+func (vx *Vxlan) RemoveUplink(uplinkName string) error {
 	return nil
 }
 
 // AddSvcSpec adds a service spec to proxy
 func (vx *Vxlan) AddSvcSpec(svcName string, spec *ServiceSpec) error {
-	return nil
+	return vx.svcProxy.AddSvcSpec(svcName, spec)
 }
 
 // DelSvcSpec removes a service spec from proxy
 func (vx *Vxlan) DelSvcSpec(svcName string, spec *ServiceSpec) error {
-	return nil
+	return vx.svcProxy.DelSvcSpec(svcName, spec)
 }
 
 // SvcProviderUpdate Service Proxy Back End update
 func (vx *Vxlan) SvcProviderUpdate(svcName string, providers []string) {
+	vx.svcProxy.ProviderUpdate(svcName, providers)
+}
+
+// GetEndpointStats fetches ep stats
+func (vx *Vxlan) GetEndpointStats() (map[string]*OfnetEndpointStats, error) {
+	return vx.svcProxy.GetEndpointStats()
+}
+
+// MultipartReply handles stats reply
+func (vx *Vxlan) MultipartReply(sw *ofctrl.OFSwitch, reply *openflow13.MultipartReply) {
+	if reply.Type == openflow13.MultipartType_Flow {
+		vx.svcProxy.FlowStats(reply)
+	}
+}
+
+// InspectState returns current state
+func (vx *Vxlan) InspectState() (interface{}, error) {
+	vxExport := struct {
+		PolicyAgent *PolicyAgent // Policy agent
+		SvcProxy    interface{}  // Service proxy
+		// VlanDb      map[uint16]*Vlan // Database of known vlans
+	}{
+		vx.policyAgent,
+		vx.svcProxy.InspectState(),
+		// vr.vlanDb,
+	}
+	return vxExport, nil
 }
 
 // initialize Fgraph on the switch
@@ -644,12 +911,19 @@ func (self *Vxlan) initFgraph() error {
 	self.vlanTable, _ = sw.NewTable(VLAN_TBL_ID)
 	self.macDestTable, _ = sw.NewTable(MAC_DEST_TBL_ID)
 
+	// setup SNAT table
+	// Matches in SNAT table (i.e. incoming) go to mac dest
+	self.svcProxy.InitSNATTable(MAC_DEST_TBL_ID)
+
 	// Init policy tables
-	err := self.policyAgent.InitTables(MAC_DEST_TBL_ID)
+	err := self.policyAgent.InitTables(SRV_PROXY_SNAT_TBL_ID)
 	if err != nil {
 		log.Fatalf("Error installing policy table. Err: %v", err)
 		return err
 	}
+
+	// Next table for DNAT is Policy
+	self.svcProxy.InitDNATTable(DST_GRP_TBL_ID)
 
 	//Create all drop entries
 	// Drop mcast source mac
@@ -681,13 +955,38 @@ func (self *Vxlan) initFgraph() error {
 	})
 	vlanMissFlow.Next(sw.DropAction())
 
-	// Redirect ARP Request packets to controller
-	arpFlow, _ := self.inputTable.NewFlow(ofctrl.FlowMatch{
-		Priority:  FLOW_MATCH_PRIORITY,
-		Ethertype: 0x0806,
-		ArpOper:   protocol.Type_Request,
+	// if arp-mode is ArpProxy, redirect ARP packets to controller
+	// In ArpFlood mode, ARP packets are flooded in datapath and
+	// there is no proxy-arp functionality
+	if self.agent.arpMode == ArpProxy {
+		self.updateArpRedirectFlow(self.agent.arpMode)
+	}
+
+	// redirect dns requests from containers (oui 02:02:xx) to controller
+	macSaMask := net.HardwareAddr{0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00}
+	macSa := net.HardwareAddr{0x02, 0x02, 0x00, 0x00, 0x00, 0x00}
+	dnsRedirectFlow, _ := self.inputTable.NewFlow(ofctrl.FlowMatch{
+		Priority:   DNS_FLOW_MATCH_PRIORITY,
+		MacSa:      &macSa,
+		MacSaMask:  &macSaMask,
+		Ethertype:  protocol.IPv4_MSG,
+		IpProto:    protocol.Type_UDP,
+		UdpDstPort: 53,
 	})
-	arpFlow.Next(sw.SendToController())
+	dnsRedirectFlow.Next(sw.SendToController())
+
+	// re-inject dns requests
+	dnsReinjectFlow, _ := self.inputTable.NewFlow(ofctrl.FlowMatch{
+		Priority:   DNS_FLOW_MATCH_PRIORITY + 1,
+		MacSa:      &macSa,
+		MacSaMask:  &macSaMask,
+		VlanId:     nameServerInternalVlanId,
+		Ethertype:  protocol.IPv4_MSG,
+		IpProto:    protocol.Type_UDP,
+		UdpDstPort: 53,
+	})
+	dnsReinjectFlow.PopVlan()
+	dnsReinjectFlow.Next(self.vlanTable)
 
 	// Drop all packets that miss mac dest lookup AND vlan flood lookup
 	floodMissFlow, _ := self.macDestTable.NewFlow(ofctrl.FlowMatch{
@@ -697,6 +996,40 @@ func (self *Vxlan) initFgraph() error {
 
 	// Drop all
 	return nil
+}
+
+// isVtepPort returns true if the port is a vtep port
+func (self *Vxlan) isVtepPort(inPort uint32) bool {
+	self.agent.vtepTableMutex.RLock()
+	defer self.agent.vtepTableMutex.RUnlock()
+	for _, vtepPort := range self.agent.vtepTable {
+		if *vtepPort == inPort {
+			return true
+		}
+	}
+
+	return false
+}
+
+// add a flow to redirect ARP packet to controller for arp-proxy
+func (self *Vxlan) updateArpRedirectFlow(newArpMode ArpModeT) {
+	sw := self.ofSwitch
+
+	add := (newArpMode == ArpProxy)
+	if add {
+		// Redirect ARP Request packets to controller
+		arpFlow, _ := self.inputTable.NewFlow(ofctrl.FlowMatch{
+			Priority:  FLOW_MATCH_PRIORITY,
+			Ethertype: 0x0806,
+			ArpOper:   protocol.Type_Request,
+		})
+		arpFlow.Next(sw.SendToController())
+		self.arpRedirectFlow = arpFlow
+	} else {
+		if self.arpRedirectFlow != nil {
+			self.arpRedirectFlow.Delete()
+		}
+	}
 }
 
 /*
@@ -717,6 +1050,8 @@ func (self *Vxlan) processArp(pkt protocol.Ethernet, inPort uint32) {
 		log.Debugf("Processing ARP packet on port %d: %+v", inPort, *t)
 		var arpIn protocol.ARP = *t
 
+		self.agent.incrStats("ArpPktRcvd")
+
 		switch arpIn.Operation {
 		case protocol.Type_Request:
 			// If it's a GARP packet, ignore processing
@@ -725,21 +1060,46 @@ func (self *Vxlan) processArp(pkt protocol.Ethernet, inPort uint32) {
 				return
 			}
 
-			if self.agent.portVlanMap[inPort] == nil {
-				log.Debugf("Invalid port vlan mapping. Ignoring arp packet")
-				return
+			self.agent.incrStats("ArpReqRcvd")
+
+			var vlan uint16
+			if self.isVtepPort(inPort) {
+				vlan = pkt.VLANID.VID
+			} else {
+				vlan_ := self.agent.getPortVlanMap(inPort)
+				if vlan_ == nil {
+					log.Debugf("Invalid port vlan mapping. Ignoring arp packet")
+					self.agent.incrStats("ArpReqInvalidPortVlan")
+					return
+				}
+				vlan = *vlan_
 			}
-			vlan := self.agent.portVlanMap[inPort]
 
 			// Lookup the Source and Dest IP in the endpoint table
-			srcEp := self.agent.getEndpointByIpVlan(arpIn.IPSrc, *vlan)
-			dstEp := self.agent.getEndpointByIpVlan(arpIn.IPDst, *vlan)
+			srcEp := self.agent.getEndpointByIpVlan(arpIn.IPSrc, vlan)
+			dstEp := self.agent.getEndpointByIpVlan(arpIn.IPDst, vlan)
 
 			// No information about the src or dest EP. Ignore processing.
 			if srcEp == nil && dstEp == nil {
 				log.Debugf("No information on source/destination. Ignoring ARP request.")
+				self.agent.incrStats("ArpRequestUnknownSrcDst")
+
 				return
 			}
+
+			// Handle packets from vtep ports
+			if self.isVtepPort(inPort) {
+				if dstEp == nil {
+					self.agent.incrStats("ArpReqUnknownDestFromVtep")
+					return
+				}
+
+				if dstEp.OriginatorIp.String() != self.agent.localIp.String() {
+					self.agent.incrStats("ArpReqNonLocalDestFromVtep")
+					return
+				}
+			}
+
 			// If we know the dstEp to be present locally, send the Proxy ARP response
 			if dstEp != nil {
 				// Container to Container communication. Send proxy ARP response.
@@ -773,18 +1133,34 @@ func (self *Vxlan) processArp(pkt protocol.Ethernet, inPort uint32) {
 					// Send the packet out
 					self.ofSwitch.Send(pktOut)
 
+					self.agent.incrStats("ArpReqRespSent")
+
 					return
 				}
 			}
+
+			proxyMac := self.svcProxy.GetSvcProxyMAC(arpIn.IPDst)
+			if proxyMac != "" {
+				pktOut := getProxyARPResp(&arpIn, proxyMac,
+					pkt.VLANID.VID, inPort)
+				self.ofSwitch.Send(pktOut)
+				self.agent.incrStats("ArpReqRespSent")
+				return
+			}
+
 			if srcEp != nil && dstEp == nil {
 				// If the ARP request was received from VTEP port
 				// Ignore processing the packet
+				self.agent.vtepTableMutex.RLock()
 				for _, vtepPort := range self.agent.vtepTable {
 					if *vtepPort == inPort {
 						log.Debugf("Received packet from VTEP port. Ignore processing")
+						self.agent.incrStats("ArpReqUnknownDestFromVtep")
+						self.agent.vtepTableMutex.RUnlock()
 						return
 					}
 				}
+				self.agent.vtepTableMutex.RUnlock()
 
 				// ARP request from local container to unknown IP
 				// Reinject ARP to VTEP ports
@@ -807,18 +1183,20 @@ func (self *Vxlan) processArp(pkt protocol.Ethernet, inPort uint32) {
 
 				// Add set tunnel action to the instruction
 				pktOut.AddAction(setTunnelAction)
-
+				self.agent.vtepTableMutex.RLock()
 				for _, vtepPort := range self.agent.vtepTable {
 					log.Debugf("Sending to VTEP port: %+v", *vtepPort)
 					pktOut.AddAction(openflow13.NewActionOutput(*vtepPort))
 				}
-
+				self.agent.vtepTableMutex.RUnlock()
 				// Send the packet out
 				self.ofSwitch.Send(pktOut)
+				self.agent.incrStats("ArpReqReinject")
 			}
 
 		case protocol.Type_Reply:
 			log.Debugf("Received ARP response packet: %+v from port %d", arpIn, inPort)
+			self.agent.incrStats("ArpRespRcvd")
 
 			ethPkt := protocol.NewEthernet()
 			ethPkt.VLANID = pkt.VLANID
@@ -856,13 +1234,15 @@ func (self *Vxlan) sendGARP(ip net.IP, mac net.HardwareAddr, vni uint64) error {
 
 	// Add set tunnel action to the instruction
 	pktOut.AddAction(setTunnelAction)
-
+	self.agent.vtepTableMutex.RLock()
 	for _, vtepPort := range self.agent.vtepTable {
 		log.Debugf("Sending to Vtep port: %+v", *vtepPort)
 		pktOut.AddAction(openflow13.NewActionOutput(*vtepPort))
 	}
-
+	self.agent.vtepTableMutex.RUnlock()
 	// Send it out
 	self.ofSwitch.Send(pktOut)
+	self.agent.incrStats("GarpPktSent")
+
 	return nil
 }

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/contiv/ofnet/ofctrl"
+	"github.com/shaleman/libOpenflow/openflow13"
 )
 
 // Interface implemented by each datapath
@@ -44,6 +45,9 @@ type OfnetDatapath interface {
 	// Remove a local endpoint from forwarding DB
 	RemoveLocalEndpoint(endpoint OfnetEndpoint) error
 
+	// Update a local endpoint state
+	UpdateLocalEndpoint(ep *OfnetEndpoint, epInfo EndpointInfo) error
+
 	// Add a remote endpoint to forwarding DB
 	AddEndpoint(endpoint *OfnetEndpoint) error
 
@@ -63,10 +67,16 @@ type OfnetDatapath interface {
 	RemoveVlan(vlanId uint16, vni uint32, vrf string) error
 
 	//Add uplink port
-	AddUplink(portNo uint32) error
+	AddUplink(uplinkPort *PortInfo) error
+
+	//Update uplink port
+	UpdateUplink(uplinkName string, update PortUpdates) error
 
 	//Delete uplink port
-	RemoveUplink(portNo uint32) error
+	RemoveUplink(uplinkName string) error
+
+	//Inject GARPs
+	InjectGARPs(epgID int)
 
 	// Add a service spec to proxy
 	AddSvcSpec(svcName string, spec *ServiceSpec) error
@@ -76,6 +86,18 @@ type OfnetDatapath interface {
 
 	// Service Proxy Back End update
 	SvcProviderUpdate(svcName string, providers []string)
+
+	// Handle multipart replies from OVS
+	MultipartReply(sw *ofctrl.OFSwitch, reply *openflow13.MultipartReply)
+
+	// Get endpoint stats
+	GetEndpointStats() (map[string]*OfnetEndpointStats, error)
+
+	// Return the datapath state
+	InspectState() (interface{}, error)
+
+	// Set global config
+	GlobalConfigUpdate(cfg OfnetGlobalConfig) error
 }
 
 // Interface implemented by each control protocol.
@@ -96,19 +118,25 @@ type OfnetProto interface {
 	GetRouterInfo() *OfnetProtoRouterInfo
 
 	//Add Local Route
-	AddLocalProtoRoute(path *OfnetProtoRouteInfo) error
+	AddLocalProtoRoute(path []*OfnetProtoRouteInfo) error
 
 	//Delete Local Route
-	DeleteLocalProtoRoute(path *OfnetProtoRouteInfo) error
+	DeleteLocalProtoRoute(path []*OfnetProtoRouteInfo) error
 
 	//Modify protocol Rib (Could be used for testing)
 	ModifyProtoRib(path interface{})
+
+	//Inspect bgp
+	InspectProto() (interface{}, error)
 }
 
 // Default port numbers
 const OFNET_MASTER_PORT = 9001
 const OFNET_AGENT_VXLAN_PORT = 9002
 const OFNET_AGENT_VLAN_PORT = 9010
+
+// internal vlan id
+const nameServerInternalVlanId = 4093
 
 // Information about each node
 type OfnetNode struct {
@@ -123,14 +151,17 @@ type OfnetEndpoint struct {
 	EndpointGroup     int       // Endpoint group identifier for policies.
 	IpAddr            net.IP    // IP address of the end point
 	IpMask            net.IP    // IP mask for the end point
+	Ipv6Addr          net.IP    // IPv6 address of the end point
+	Ipv6Mask          net.IP    // IPv6 mask for the end point
 	Vrf               string    // IP address namespace
 	MacAddrStr        string    // Mac address of the end point(in string format)
 	Vlan              uint16    // Vlan Id for the endpoint
 	Vni               uint32    // Vxlan VNI
-	OriginatorIp      net.IP    // Originating switch
-	PortNo            uint32    // Port number on originating switch
-	Timestamp         time.Time // Timestamp of the last event
 	EndpointGroupVlan uint16    // EnpointGroup Vlan, needed in non-Standalone mode of netplugin
+	OriginatorIp      net.IP    // Originating switch
+	PortNo            uint32    `json:"-"` // Port number on originating switch
+	Dscp              int       `json:"-"` // DSCP value for the endpoint
+	Timestamp         time.Time // Timestamp of the last event
 }
 
 // OfnetPolicyRule has security rule to be installed
@@ -148,27 +179,131 @@ type OfnetPolicyRule struct {
 	Action           string // rule action: 'accept' or 'deny'
 }
 
+// OfnetProtoNeighborInfo has bgp neighbor info
 type OfnetProtoNeighborInfo struct {
 	ProtocolType string // type of protocol
 	NeighborIP   string // ip address of the neighbor
 	As           string // As of neighbor if applicable
 }
 
+// OfnetProtoRouterInfo has local router info
 type OfnetProtoRouterInfo struct {
-	ProtocolType string // type of protocol
-	RouterIP     string // ip address of the router
-	VlanIntf     string // uplink L2 intf
-	As           string // As for Bgp protocol
+	ProtocolType string   // type of protocol
+	RouterIP     string   // ip address of the router
+	UplinkPort   PortInfo // uplink L2 intf
+	As           string   // As for Bgp protocol
 }
 
+// OfnetProtoRouteInfo contains a route
 type OfnetProtoRouteInfo struct {
 	ProtocolType string // type of protocol
 	localEpIP    string
 	nextHopIP    string
 }
 
+type ArpModeT string
+
+const (
+	// ArpFlood - ARP packets will be flooded in this mode
+	ArpFlood ArpModeT = "flood"
+	// ArpProxy - ARP packets will be redirected to controller
+	ArpProxy ArpModeT = "proxy"
+
+	// PortType - individual port
+	PortType = "individual"
+	// BondType - bonded port
+	BondType = "bond"
+
+	// LacpUpdate - for port update info
+	LacpUpdate = "lacp-upd"
+)
+
+// OfnetGlobalConfig has global level configs for ofnet
+type OfnetGlobalConfig struct {
+	ArpMode ArpModeT // arp mode: proxy or flood
+}
+
+// OfnetVrfInfo has info about a VRF
 type OfnetVrfInfo struct {
-	VrfName     string //vrf name
-	VrfId       uint16 //local vrf id
-	NumNetworks uint16 //ref count of networks in the vrf
+	VrfName     string // vrf name
+	VrfId       uint16 // local vrf id
+	NumNetworks uint16 // ref count of networks in the vrf
+}
+
+// OfnetDatapathStats is generic stats struct
+type OfnetDatapathStats struct {
+	PacketsIn  uint64
+	BytesIn    uint64
+	PacketsOut uint64
+	BytesOut   uint64
+}
+
+// OfnetSvcProviderStats has stats for a provider of a service
+type OfnetSvcProviderStats struct {
+	ProviderIP         string // Provider IP address
+	ServiceIP          string // service ip address
+	ServiceVrf         string // Provider VRF name
+	OfnetDatapathStats        // stats
+}
+
+// OfnetSvcStats per service stats from one client
+type OfnetSvcStats struct {
+	ServiceIP  string                           // service ip address
+	ServiceVRF string                           // service vrf name
+	Protocol   string                           // service protocol tcp | udp
+	SvcPort    string                           // Service Port
+	ProvPort   string                           // Provider port
+	SvcStats   OfnetDatapathStats               // aggregate service stats
+	ProvStats  map[string]OfnetSvcProviderStats // per provider stats
+}
+
+// OfnetEndpointStats has stats for local endpoints
+type OfnetEndpointStats struct {
+	EndpointIP string                   // Endpoint IP address
+	VrfName    string                   // vrf name
+	PortStats  OfnetDatapathStats       // Aggregate port stats
+	SvcStats   map[string]OfnetSvcStats // Service level stats
+}
+
+type linkStatus int
+
+// LinkStatus maintains link up/down information
+const (
+	linkDown linkStatus = iota
+	linkUp
+)
+
+// LinkInfo maintains individual link information
+type LinkInfo struct {
+	Name       string
+	Port       *PortInfo
+	LinkStatus linkStatus
+	OfPort     uint32
+}
+
+// PortInfo maintains port information
+type PortInfo struct {
+	Name        string
+	Type        string
+	LinkStatus  linkStatus
+	MbrLinks    []*LinkInfo
+	ActiveLinks []*LinkInfo
+}
+
+// PortUpdates maintains multiplae port update info
+type PortUpdates struct {
+	PortName string
+	Updates  []PortUpdate
+}
+
+// PortUpdate maintains information about port update
+type PortUpdate struct {
+	UpdateType string
+	UpdateInfo interface{}
+}
+
+// LACP update
+type LinkUpdateInfo struct {
+	LinkName   string
+	LacpStatus bool
 }

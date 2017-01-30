@@ -23,6 +23,7 @@ import (
 	"github.com/shaleman/libOpenflow/util"
 
 	log "github.com/Sirupsen/logrus"
+	cmap "github.com/streamrail/concurrent-map"
 )
 
 type OFSwitch struct {
@@ -37,14 +38,18 @@ type OFSwitch struct {
 	outputPorts  map[uint32]*Output
 }
 
-var switchDb map[string]*OFSwitch = make(map[string]*OFSwitch)
+var switchDb cmap.ConcurrentMap
+
+func init() {
+	switchDb = cmap.New()
+}
 
 // Builds and populates a Switch struct then starts listening
 // for OpenFlow messages on conn.
 func NewSwitch(stream *util.MessageStream, dpid net.HardwareAddr, app AppInterface) *OFSwitch {
 	var s *OFSwitch
 
-	if switchDb[dpid.String()] == nil {
+	if getSwitch(dpid) == nil {
 		log.Infoln("Openflow Connection for new switch:", dpid)
 
 		s = new(OFSwitch)
@@ -56,7 +61,7 @@ func NewSwitch(stream *util.MessageStream, dpid net.HardwareAddr, app AppInterfa
 		s.initFgraph()
 
 		// Save it
-		switchDb[dpid.String()] = s
+		switchDb.Set(dpid.String(), s)
 
 		// Main receive loop for the switch
 		go s.receive()
@@ -64,7 +69,7 @@ func NewSwitch(stream *util.MessageStream, dpid net.HardwareAddr, app AppInterfa
 	} else {
 		log.Infoln("Openflow Connection for switch:", dpid)
 
-		s = switchDb[dpid.String()]
+		s = getSwitch(dpid)
 		s.stream = stream
 		s.dpid = dpid
 	}
@@ -77,8 +82,12 @@ func NewSwitch(stream *util.MessageStream, dpid net.HardwareAddr, app AppInterfa
 }
 
 // Returns a pointer to the Switch mapped to dpid.
-func Switch(dpid net.HardwareAddr) *OFSwitch {
-	return switchDb[dpid.String()]
+func getSwitch(dpid net.HardwareAddr) *OFSwitch {
+	sw, _ := switchDb.Get(dpid.String())
+	if sw == nil {
+		return nil
+	}
+	return sw.(*OFSwitch)
 }
 
 // Returns the dpid of Switch s.
@@ -93,6 +102,7 @@ func (self *OFSwitch) Send(req util.Message) {
 
 func (self *OFSwitch) Disconnect() {
 	self.stream.Shutdown <- true
+	self.switchDisconnected()
 }
 
 // Handle switch connected event
@@ -110,6 +120,7 @@ func (self *OFSwitch) switchConnected() {
 // Handle switch disconnected event
 func (self *OFSwitch) switchDisconnected() {
 	self.app.SwitchDisconnected(self)
+	switchDb.Remove(self.DPID().String())
 }
 
 // Receive loop for each Switch.
@@ -125,7 +136,6 @@ func (self *OFSwitch) receive() {
 
 			// send Switch disconnected callback
 			self.switchDisconnected()
-
 			return
 		}
 	}
@@ -186,7 +196,7 @@ func (self *OFSwitch) handleMessages(dpid net.HardwareAddr, msg util.Message) {
 
 		}
 	case *openflow13.PacketIn:
-		log.Infof("Received packet(ofctrl): %+v", t)
+		log.Debugf("Received packet(ofctrl): %+v", t)
 		// send packet rcvd callback
 		self.app.PacketRcvd(self, (*PacketIn)(t))
 
@@ -203,7 +213,9 @@ func (self *OFSwitch) handleMessages(dpid net.HardwareAddr, msg util.Message) {
 	case *openflow13.MultipartRequest:
 
 	case *openflow13.MultipartReply:
-		// FIXME: find a way to get multipart resp to app
+		log.Debugf("Received MultipartReply")
+		// send packet rcvd callback
+		self.app.MultipartReply(self, (*openflow13.MultipartReply)(t))
 
 	}
 }
